@@ -24,6 +24,9 @@ struct Config {
     openclaw_chat_completions_url: String,
     gateway_token_header: HeaderName,
     gateway_token_value: HeaderValue,
+    telegram_api_base: String,
+    telegram_bot_token: Option<String>,
+    telegram_chat_id: Option<String>,
     block_ms: usize,
     count: usize,
 }
@@ -141,17 +144,21 @@ async fn handle_stream_message(
     };
 
     let result = match call_openclaw(http, config, &task).await {
-        Ok(response) => json!({
-            "task_id": task.task_id.clone(),
-            "status": "completed",
-            "consumer": config.consumer_name,
-            "assigned_consumer": task.assigned_consumer.clone(),
-            "source_stream": source_stream,
-            "source_stream_id": stream_id,
-            "completed_at_ms": now_millis(),
-            "response": response,
-            "metadata": task.metadata.clone(),
-        }),
+        Ok(response) => {
+            let telegram = send_telegram_notification(http, config, &task, &response).await;
+            json!({
+                "task_id": task.task_id.clone(),
+                "status": "completed",
+                "consumer": config.consumer_name,
+                "assigned_consumer": task.assigned_consumer.clone(),
+                "source_stream": source_stream,
+                "source_stream_id": stream_id,
+                "completed_at_ms": now_millis(),
+                "response": response,
+                "telegram": telegram,
+                "metadata": task.metadata.clone(),
+            })
+        }
         Err(err) => json!({
             "task_id": task.task_id.clone(),
             "status": "failed",
@@ -197,6 +204,83 @@ async fn call_openclaw(http: &reqwest::Client, config: &Config, task: &ChatTask)
     }
 
     serde_json::from_str::<Value>(&text).context("OpenClaw response was not valid JSON")
+}
+
+async fn send_telegram_notification(
+    http: &reqwest::Client,
+    config: &Config,
+    task: &ChatTask,
+    response: &Value,
+) -> Value {
+    match send_telegram_notification_inner(http, config, task, response).await {
+        Ok(value) => value,
+        Err(err) => {
+            warn!(task_id = %task.task_id, error = %err, "telegram notification failed");
+            json!({
+                "status": "failed",
+                "error": err.to_string(),
+            })
+        }
+    }
+}
+
+async fn send_telegram_notification_inner(
+    http: &reqwest::Client,
+    config: &Config,
+    task: &ChatTask,
+    response: &Value,
+) -> Result<Value> {
+    let Some(bot_token) = config.telegram_bot_token.as_deref() else {
+        return Ok(json!({
+            "status": "skipped",
+            "reason": "TELEGRAM_BOT_TOKEN is not configured",
+        }));
+    };
+    let Some(chat_id) = config.telegram_chat_id.as_deref() else {
+        return Ok(json!({
+            "status": "skipped",
+            "reason": "TELEGRAM_CHAT_ID is not configured",
+        }));
+    };
+
+    let task_title = task_title(task);
+    let completion = completion_text(response).unwrap_or_else(|| {
+        serde_json::to_string_pretty(response).unwrap_or_else(|_| response.to_string())
+    });
+    let message = truncate_string(&format!("{task_title}\n\n{completion}"), 3900);
+    let url = format!(
+        "{}/bot{}/sendMessage",
+        config.telegram_api_base.trim_end_matches('/'),
+        bot_token
+    );
+
+    let response = http
+        .post(url)
+        .json(&json!({
+            "chat_id": chat_id,
+            "text": message,
+            "disable_web_page_preview": true,
+        }))
+        .send()
+        .await
+        .context("Telegram sendMessage request failed")?;
+
+    let status = response.status();
+    let text = response
+        .text()
+        .await
+        .context("failed to read Telegram response body")?;
+
+    if !status.is_success() {
+        return Err(anyhow!(
+            "Telegram returned HTTP {status}: {}",
+            truncate(&text, 500)
+        ));
+    }
+
+    Ok(json!({
+        "status": "sent",
+    }))
 }
 
 async fn publish_result(
@@ -369,6 +453,9 @@ impl Config {
             heartbeat_interval_ms,
             started_at_ms: now_millis(),
             openclaw_chat_completions_url: openclaw_chat_completions_url(),
+            telegram_api_base: env_or("TELEGRAM_API_BASE", "https://api.telegram.org"),
+            telegram_bot_token: optional_env("TELEGRAM_BOT_TOKEN"),
+            telegram_chat_id: optional_env("TELEGRAM_CHAT_ID"),
             block_ms: parse_env("REDIS_BLOCK_MS", 5_000)?,
             count: parse_env("REDIS_READ_COUNT", 1)?,
             gateway_token_header,
@@ -442,10 +529,32 @@ fn consumer_discovery_key(registry_key: &str, name: &str) -> String {
     format!("{registry_key}:{name}")
 }
 
+fn task_title(task: &ChatTask) -> String {
+    task.metadata
+        .as_ref()
+        .and_then(|metadata| metadata.get("title"))
+        .and_then(Value::as_str)
+        .unwrap_or(&task.task_id)
+        .to_owned()
+}
+
+fn completion_text(response: &Value) -> Option<String> {
+    response
+        .pointer("/choices/0/message/content")
+        .and_then(Value::as_str)
+        .or_else(|| response.get("output_text").and_then(Value::as_str))
+        .or_else(|| response.get("content").and_then(Value::as_str))
+        .map(str::to_owned)
+}
+
 fn truncate(value: &str, max_len: usize) -> &str {
     if value.len() <= max_len {
         value
     } else {
         &value[..max_len]
     }
+}
+
+fn truncate_string(value: &str, max_len: usize) -> String {
+    value.chars().take(max_len).collect()
 }

@@ -66,11 +66,39 @@ pub struct ConsumerDiscovery {
     pub expires_at_ms: u64,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskUpdate {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub card_id: Option<String>,
+    pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub questions: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub consumer: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_stream_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub result_stream_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub completed_at_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub response: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub telegram: Option<Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum PublisherResponse {
     Accepted { task_id: String, stream_id: String },
     Consumers { consumers: Vec<ConsumerDiscovery> },
+    TaskUpdate(TaskUpdate),
     Error { message: String },
 }
 

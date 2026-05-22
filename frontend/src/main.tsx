@@ -20,7 +20,7 @@ import "./styles.css";
 
 type ColumnId = "backlog" | "ready" | "in_progress" | "review" | "done";
 type Priority = "low" | "medium" | "high";
-type PublishStatus = "draft" | "queued" | "failed";
+type PublishStatus = "draft" | "queued" | "failed" | "done" | "needs_input";
 type SocketStatus = "closed" | "connecting" | "open";
 
 interface Column {
@@ -44,6 +44,11 @@ interface KanbanCard {
   taskId?: string;
   streamId?: string;
   error?: string;
+  resultMessage?: string;
+  resultStreamId?: string;
+  completedAt?: number;
+  questions?: string[];
+  completedBy?: string;
   createdAt: number;
   updatedAt: number;
   lastPublishedAt?: number;
@@ -89,7 +94,24 @@ interface PublisherConsumers {
   consumers: ConsumerDiscovery[];
 }
 
-type PublisherResponse = PublisherAccepted | PublisherError | PublisherConsumers;
+interface PublisherTaskUpdate {
+  type: "task_update";
+  task_id?: string;
+  card_id?: string;
+  status: "done" | "needs_input" | "failed" | string;
+  message?: string;
+  questions?: string[];
+  error?: string;
+  consumer?: string;
+  result_stream_id?: string;
+  completed_at_ms?: number;
+}
+
+type PublisherResponse =
+  | PublisherAccepted
+  | PublisherError
+  | PublisherConsumers
+  | PublisherTaskUpdate;
 
 const columns: Column[] = [
   { id: "backlog", label: "Backlog", accent: "#6b7280" },
@@ -157,11 +179,14 @@ function App() {
   const [socketStatus, setSocketStatus] =
     React.useState<SocketStatus>("closed");
   const [publishQueue, setPublishQueue] = React.useState<string[]>([]);
+  const [pendingCardId, setPendingCardId] = React.useState<string | null>(null);
   const [consumers, setConsumers] = React.useState<ConsumerDiscovery[]>([]);
   const [lastDiscoveryAt, setLastDiscoveryAt] = React.useState<number | null>(null);
   const [lastEvent, setLastEvent] = React.useState("Disconnected");
   const socketRef = React.useRef<WebSocket | null>(null);
   const pendingCardRef = React.useRef<string | null>(null);
+  const queueRef = React.useRef<string[]>([]);
+  const cardsRef = React.useRef<KanbanCard[]>(cards);
 
   const selectedCard = cards.find((card) => card.id === selectedId) ?? null;
   const queuedCount = cards.filter((card) => card.publishStatus === "queued").length;
@@ -169,6 +194,7 @@ function App() {
 
   React.useEffect(() => {
     localStorage.setItem(storageKey, JSON.stringify(cards));
+    cardsRef.current = cards;
   }, [cards]);
 
   React.useEffect(() => {
@@ -210,6 +236,9 @@ function App() {
       setConsumers([]);
       socketRef.current = null;
       pendingCardRef.current = null;
+      queueRef.current = [];
+      setPublishQueue([]);
+      setPendingCardId(null);
     };
 
     socket.onerror = () => {
@@ -226,6 +255,9 @@ function App() {
     socketRef.current?.close();
     socketRef.current = null;
     pendingCardRef.current = null;
+    queueRef.current = [];
+    setPublishQueue([]);
+    setPendingCardId(null);
     setSocketStatus("closed");
     setConsumers([]);
     setLastEvent("Disconnected");
@@ -243,29 +275,35 @@ function App() {
       return;
     }
 
-    setPublishQueue((queue) => {
-      const [nextId, ...remaining] = queue;
-      if (!nextId || pendingCardRef.current) {
-        return queue;
-      }
+    if (pendingCardRef.current) {
+      return;
+    }
 
-      const card = cards.find((item) => item.id === nextId);
-      if (!card) {
-        return remaining;
-      }
+    const [nextId, ...remaining] = queueRef.current;
+    if (!nextId) {
+      return;
+    }
 
-      pendingCardRef.current = nextId;
-      socket.send(JSON.stringify(toPublisherPayload(card)));
-      setLastEvent(`Publishing ${card.title}`);
-      return remaining;
-    });
+    queueRef.current = remaining;
+    setPublishQueue(remaining);
+
+    const card = cardsRef.current.find((item) => item.id === nextId);
+    if (!card) {
+      window.setTimeout(() => flushPublishQueue(socket), 0);
+      return;
+    }
+
+    pendingCardRef.current = nextId;
+    setPendingCardId(nextId);
+    socket.send(JSON.stringify(toPublisherPayload(card)));
+    setLastEvent(`Publishing ${card.title}`);
   }
 
   React.useEffect(() => {
-    if (socketStatus === "open" && publishQueue.length > 0) {
+    if (socketStatus === "open" && publishQueue.length > 0 && !pendingCardId) {
       flushPublishQueue();
     }
-  }, [socketStatus, publishQueue, cards]);
+  }, [socketStatus, publishQueue, pendingCardId]);
 
   function handlePublisherResponse(raw: string) {
     let response: PublisherResponse;
@@ -283,8 +321,14 @@ function App() {
       return;
     }
 
+    if (response.type === "task_update") {
+      applyTaskUpdate(response);
+      return;
+    }
+
     const pendingId = pendingCardRef.current;
     pendingCardRef.current = null;
+    setPendingCardId(null);
 
     if (!pendingId) {
       setLastEvent("Publisher response received");
@@ -316,6 +360,7 @@ function App() {
   function markPendingFailed(message: string) {
     const pendingId = pendingCardRef.current;
     pendingCardRef.current = null;
+    setPendingCardId(null);
     if (pendingId) {
       markCardFailed(pendingId, message);
     } else {
@@ -337,6 +382,44 @@ function App() {
       )
     );
     setLastEvent(message);
+  }
+
+  function applyTaskUpdate(update: PublisherTaskUpdate) {
+    const matched = cardsRef.current.some(
+      (card) =>
+        (update.card_id && card.id === update.card_id) ||
+        (update.task_id && card.taskId === update.task_id)
+    );
+    setCards((current) =>
+      current.map((card) => {
+        const isMatch =
+          (update.card_id && card.id === update.card_id) ||
+          (update.task_id && card.taskId === update.task_id);
+        if (!isMatch) {
+          return card;
+        }
+
+        const status = normalizeUpdateStatus(update.status);
+        return {
+          ...card,
+          column: columnForUpdateStatus(status, card.column),
+          publishStatus: status,
+          error: status === "failed" ? update.error || update.message : undefined,
+          resultMessage: update.message,
+          resultStreamId: update.result_stream_id,
+          completedAt: update.completed_at_ms,
+          questions: update.questions ?? [],
+          completedBy: update.consumer,
+          updatedAt: Date.now()
+        };
+      })
+    );
+
+    setLastEvent(
+      matched
+        ? update.message || statusText(update.status)
+        : `Update for ${update.task_id ?? "unknown task"}`
+    );
   }
 
   function openNewCard(column: ColumnId) {
@@ -387,6 +470,15 @@ function App() {
                 dueDate: draft.dueDate,
                 tags,
                 publishStatus: card.publishStatus === "queued" ? "draft" : card.publishStatus,
+                taskId: undefined,
+                streamId: undefined,
+                error: undefined,
+                resultMessage: undefined,
+                resultStreamId: undefined,
+                completedAt: undefined,
+                questions: undefined,
+                completedBy: undefined,
+                lastPublishedAt: undefined,
                 updatedAt: Date.now()
               }
             : card
@@ -417,7 +509,8 @@ function App() {
 
   function deleteCard(cardId: string) {
     setCards((current) => current.filter((card) => card.id !== cardId));
-    setPublishQueue((queue) => queue.filter((id) => id !== cardId));
+    queueRef.current = queueRef.current.filter((id) => id !== cardId);
+    setPublishQueue(queueRef.current);
     if (selectedId === cardId) {
       setSelectedId(null);
       setIsEditorOpen(false);
@@ -438,6 +531,11 @@ function App() {
       return;
     }
 
+    if (isPublishing(card)) {
+      setLastEvent("Task already queued");
+      return;
+    }
+
     setCards((current) =>
       current.map((item) =>
         item.id === cardId
@@ -450,7 +548,7 @@ function App() {
           : item
       )
     );
-    setPublishQueue((queue) => (queue.includes(cardId) ? queue : [...queue, cardId]));
+    enqueueCards([cardId]);
 
     if (socketStatus === "closed") {
       connect();
@@ -459,15 +557,37 @@ function App() {
 
   function publishColumn(column: ColumnId) {
     const ids = cards
-      .filter((card) => card.column === column && card.publishStatus !== "queued")
+      .filter((card) => card.column === column && !isPublishing(card))
       .map((card) => card.id);
     if (ids.length === 0) {
       return;
     }
-    setPublishQueue((queue) => [...queue, ...ids.filter((id) => !queue.includes(id))]);
+    enqueueCards(ids);
     if (socketStatus === "closed") {
       connect();
     }
+  }
+
+  function enqueueCards(cardIds: string[]) {
+    const existing = new Set(queueRef.current);
+    const nextIds = cardIds.filter(
+      (cardId) => !existing.has(cardId) && pendingCardRef.current !== cardId
+    );
+    if (nextIds.length === 0) {
+      return;
+    }
+
+    queueRef.current = [...queueRef.current, ...nextIds];
+    setPublishQueue(queueRef.current);
+  }
+
+  function isPublishing(card: KanbanCard) {
+    return (
+      card.publishStatus === "queued" ||
+      publishQueue.includes(card.id) ||
+      pendingCardId === card.id ||
+      pendingCardRef.current === card.id
+    );
   }
 
   function onDrop(column: ColumnId) {
@@ -563,6 +683,7 @@ function App() {
                   <KanbanCardView
                     key={card.id}
                     card={card}
+                    publishing={isPublishing(card)}
                     active={card.id === selectedId}
                     onSelect={() => setSelectedId(card.id)}
                     onEdit={() => openEditCard(card)}
@@ -611,7 +732,11 @@ function App() {
                 <p>{selectedCard.column.replace("_", " ")}</p>
                 <h2>{selectedCard.title}</h2>
               </div>
-              <button className="primary-button" onClick={() => publishCard(selectedCard.id)}>
+              <button
+                className="primary-button"
+                onClick={() => publishCard(selectedCard.id)}
+                disabled={isPublishing(selectedCard)}
+              >
                 <Send size={18} />
                 Publish
               </button>
@@ -621,9 +746,10 @@ function App() {
               <Field label="Priority" value={priorityLabels[selectedCard.priority]} />
               <Field label="Owner" value={selectedCard.assignee || "Unassigned"} />
               <Field label="Consumer" value={selectedCard.assignedConsumer || "Auto"} />
+              <Field label="Completed By" value={selectedCard.completedBy || "None"} />
               <Field label="Due" value={selectedCard.dueDate || "None"} />
               <Field label="Task ID" value={selectedCard.taskId ?? "Not queued"} />
-              <Field label="Stream ID" value={selectedCard.streamId ?? "None"} />
+              <Field label="Result ID" value={selectedCard.resultStreamId ?? "None"} />
             </div>
             <div className="prompt-panel">
               <div className="panel-title">
@@ -632,6 +758,22 @@ function App() {
               </div>
               <p>{selectedCard.prompt}</p>
             </div>
+            {selectedCard.resultMessage || selectedCard.questions?.length ? (
+              <div className="result-panel">
+                <div className="panel-title">
+                  <Check size={18} />
+                  <span>Result</span>
+                </div>
+                {selectedCard.resultMessage ? <p>{selectedCard.resultMessage}</p> : null}
+                {selectedCard.questions?.length ? (
+                  <ul className="question-list">
+                    {selectedCard.questions.map((question) => (
+                      <li key={question}>{question}</li>
+                    ))}
+                  </ul>
+                ) : null}
+              </div>
+            ) : null}
             {selectedCard.error ? (
               <div className="error-panel">{selectedCard.error}</div>
             ) : null}
@@ -810,6 +952,7 @@ function App() {
 
 function KanbanCardView({
   card,
+  publishing,
   active,
   onSelect,
   onEdit,
@@ -819,6 +962,7 @@ function KanbanCardView({
   onDragEnd
 }: {
   card: KanbanCard;
+  publishing: boolean;
   active: boolean;
   onSelect: () => void;
   onEdit: () => void;
@@ -851,6 +995,7 @@ function KanbanCardView({
         <div className="card-actions">
           <button
             className="icon-button"
+            disabled={publishing}
             onClick={(event) => {
               event.stopPropagation();
               onPublish();
@@ -900,6 +1045,24 @@ function StatusBadge({ status }: { status: PublishStatus }) {
       <span className="publish-status failed">
         <Circle size={14} />
         Failed
+      </span>
+    );
+  }
+
+  if (status === "done") {
+    return (
+      <span className="publish-status done">
+        <Check size={14} />
+        Done
+      </span>
+    );
+  }
+
+  if (status === "needs_input") {
+    return (
+      <span className="publish-status needs-input">
+        <MessageSquareText size={14} />
+        Review
       </span>
     );
   }
@@ -980,6 +1143,42 @@ function parseTags(value: string) {
     .split(",")
     .map((tag) => tag.trim())
     .filter(Boolean);
+}
+
+function normalizeUpdateStatus(status: string): PublishStatus {
+  if (status === "done" || status === "completed") {
+    return "done";
+  }
+  if (status === "needs_input") {
+    return "needs_input";
+  }
+  if (status === "failed") {
+    return "failed";
+  }
+  return "queued";
+}
+
+function columnForUpdateStatus(status: PublishStatus, currentColumn: ColumnId): ColumnId {
+  if (status === "done") {
+    return "done";
+  }
+  if (status === "needs_input" || status === "failed") {
+    return "review";
+  }
+  return currentColumn;
+}
+
+function statusText(status: string) {
+  if (status === "done" || status === "completed") {
+    return "Task completed";
+  }
+  if (status === "needs_input") {
+    return "Task needs review";
+  }
+  if (status === "failed") {
+    return "Task failed";
+  }
+  return "Task updated";
 }
 
 function todayPlus(days: number) {

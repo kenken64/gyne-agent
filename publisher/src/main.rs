@@ -8,10 +8,13 @@ use axum::{
     routing::get,
     Json, Router,
 };
+use futures_util::{stream::SplitSink, SinkExt, StreamExt};
+use redis::streams::StreamReadReply;
 use serde::Serialize;
 use serde_json::{json, Value};
 use std::{collections::HashMap, env, net::SocketAddr, sync::Arc};
-use task_core::{now_millis, ConsumerDiscovery, PublisherResponse, TaskRequest};
+use task_core::{now_millis, ConsumerDiscovery, PublisherResponse, TaskRequest, TaskUpdate};
+use tokio::sync::broadcast;
 use tower_http::trace::TraceLayer;
 use tracing::{error, info, warn};
 
@@ -19,9 +22,12 @@ use tracing::{error, info, warn};
 struct AppState {
     redis: redis::Client,
     task_stream: String,
+    result_stream: String,
     default_model: Option<String>,
     consumer_registry_key: String,
     consumer_stale_after_ms: u64,
+    result_block_ms: usize,
+    updates: broadcast::Sender<PublisherResponse>,
 }
 
 #[tokio::main]
@@ -34,17 +40,25 @@ async fn main() -> Result<()> {
         .context("PUBLISHER_BIND must be a valid socket address")?;
     let redis_url = env_or("REDIS_URL", "redis://127.0.0.1/");
     let task_stream = env_or("TASK_STREAM", "openclaw:tasks");
+    let result_stream = env_or("RESULT_STREAM", "openclaw:results");
     let default_model = optional_env("DEFAULT_MODEL");
     let consumer_registry_key = env_or("CONSUMER_REGISTRY_KEY", "openclaw:consumers");
     let consumer_stale_after_ms = parse_env("CONSUMER_STALE_AFTER_MS", 15_000)?;
+    let result_block_ms = parse_env("RESULT_STREAM_BLOCK_MS", 5_000)?;
+    let update_buffer = parse_env("PUBLISHER_UPDATE_BUFFER", 256)?;
+    let (updates, _) = broadcast::channel(update_buffer);
 
     let state = Arc::new(AppState {
         redis: redis::Client::open(redis_url).context("failed to create Redis client")?,
         task_stream,
+        result_stream,
         default_model,
         consumer_registry_key,
         consumer_stale_after_ms,
+        result_block_ms,
+        updates,
     });
+    spawn_result_listener(state.clone());
 
     let app = Router::new()
         .route("/health", get(health))
@@ -67,6 +81,7 @@ async fn health(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
     Json(json!({
         "status": "ok",
         "task_stream": state.task_stream,
+        "result_stream": state.result_stream,
         "consumer_registry_key": state.consumer_registry_key,
         "has_default_model": state.default_model.is_some(),
     }))
@@ -92,13 +107,14 @@ async fn ws_handler(ws: WebSocketUpgrade, State(state): State<Arc<AppState>>) ->
     ws.on_upgrade(move |socket| handle_socket(socket, state))
 }
 
-async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
+async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
+    let (mut sender, mut receiver) = socket.split();
     let mut redis = match state.redis.get_multiplexed_async_connection().await {
         Ok(connection) => connection,
         Err(err) => {
             error!(error = %err, "failed to connect to Redis");
             let _ = send_json(
-                &mut socket,
+                &mut sender,
                 &PublisherResponse::Error {
                     message: "failed to connect to Redis".to_owned(),
                 },
@@ -107,37 +123,59 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
             return;
         }
     };
+    let mut updates = state.updates.subscribe();
 
-    while let Some(message) = socket.recv().await {
-        let message = match message {
-            Ok(message) => message,
-            Err(err) => {
-                warn!(error = %err, "websocket receive failed");
-                return;
-            }
-        };
+    loop {
+        tokio::select! {
+            message = receiver.next() => {
+                let Some(message) = message else {
+                    return;
+                };
+                let message = match message {
+                    Ok(message) => message,
+                    Err(err) => {
+                        warn!(error = %err, "websocket receive failed");
+                        return;
+                    }
+                };
 
-        let response = match message {
-            Message::Text(text) => {
-                handle_client_payload(text.to_string().as_bytes(), &state, &mut redis).await
-            }
-            Message::Binary(bytes) => {
-                handle_client_payload(bytes.as_ref(), &state, &mut redis).await
-            }
-            Message::Ping(bytes) => {
-                if let Err(err) = socket.send(Message::Pong(bytes)).await {
-                    warn!(error = %err, "websocket pong failed");
+                let response = match message {
+                    Message::Text(text) => {
+                        handle_client_payload(text.to_string().as_bytes(), &state, &mut redis).await
+                    }
+                    Message::Binary(bytes) => {
+                        handle_client_payload(bytes.as_ref(), &state, &mut redis).await
+                    }
+                    Message::Ping(bytes) => {
+                        if let Err(err) = sender.send(Message::Pong(bytes)).await {
+                            warn!(error = %err, "websocket pong failed");
+                            return;
+                        }
+                        continue;
+                    }
+                    Message::Pong(_) => continue,
+                    Message::Close(_) => return,
+                };
+
+                if let Err(err) = send_json(&mut sender, &response).await {
+                    warn!(error = %err, "websocket send failed");
                     return;
                 }
-                continue;
             }
-            Message::Pong(_) => continue,
-            Message::Close(_) => return,
-        };
-
-        if let Err(err) = send_json(&mut socket, &response).await {
-            warn!(error = %err, "websocket send failed");
-            return;
+            update = updates.recv() => {
+                match update {
+                    Ok(update) => {
+                        if let Err(err) = send_json(&mut sender, &update).await {
+                            warn!(error = %err, "websocket update send failed");
+                            return;
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                        warn!(skipped, "websocket skipped lagged task updates");
+                    }
+                    Err(broadcast::error::RecvError::Closed) => return,
+                }
+            }
         }
     }
 }
@@ -293,9 +331,213 @@ fn discovery_from_hash(fields: HashMap<String, String>) -> Option<ConsumerDiscov
     })
 }
 
-async fn send_json<T: Serialize>(socket: &mut WebSocket, value: &T) -> Result<()> {
+fn spawn_result_listener(state: Arc<AppState>) {
+    tokio::spawn(async move {
+        loop {
+            match state.redis.get_multiplexed_async_connection().await {
+                Ok(mut redis) => {
+                    if let Err(err) = listen_for_results(&mut redis, &state).await {
+                        error!(error = %err, "result stream listener failed");
+                    }
+                }
+                Err(err) => {
+                    error!(error = %err, "failed to connect to Redis for result listener");
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        }
+    });
+}
+
+async fn listen_for_results(
+    redis: &mut redis::aio::MultiplexedConnection,
+    state: &AppState,
+) -> Result<()> {
+    let mut last_id = "$".to_owned();
+    info!(result_stream = %state.result_stream, "publisher result listener started");
+
+    loop {
+        let reply: StreamReadReply = redis::cmd("XREAD")
+            .arg("BLOCK")
+            .arg(state.result_block_ms)
+            .arg("COUNT")
+            .arg(10)
+            .arg("STREAMS")
+            .arg(&state.result_stream)
+            .arg(&last_id)
+            .query_async(redis)
+            .await
+            .context("failed to read result stream")?;
+
+        for stream in reply.keys {
+            for message in stream.ids {
+                last_id = message.id.clone();
+                match result_update_from_fields(&message.id, &message.map) {
+                    Ok(update) => {
+                        let _ = state.updates.send(PublisherResponse::TaskUpdate(update));
+                    }
+                    Err(err) => {
+                        warn!(result_stream_id = %message.id, error = %err, "failed to parse task result");
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn result_update_from_fields(
+    result_stream_id: &str,
+    fields: &HashMap<String, redis::Value>,
+) -> Result<TaskUpdate> {
+    let payload = fields
+        .get("payload")
+        .context("result stream entry is missing payload field")
+        .and_then(|value| {
+            redis::from_redis_value::<String>(value).context("payload field is not a string")
+        })?;
+    let value: Value = serde_json::from_str(&payload).context("result payload is not JSON")?;
+    Ok(result_update_from_value(result_stream_id, &value))
+}
+
+fn result_update_from_value(result_stream_id: &str, value: &Value) -> TaskUpdate {
+    let raw_status = value
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or("completed");
+    let response = value.get("response").cloned();
+    let response_content = response.as_ref().and_then(completion_text);
+    let structured_content = response_content
+        .as_deref()
+        .and_then(|content| serde_json::from_str::<Value>(content).ok());
+    let response_status = response
+        .as_ref()
+        .and_then(|response| response.get("status"))
+        .and_then(Value::as_str)
+        .or_else(|| {
+            structured_content
+                .as_ref()
+                .and_then(|content| content.get("status"))
+                .and_then(Value::as_str)
+        });
+    let questions = extract_questions(value);
+    let status = if raw_status == "failed" || response_status == Some("failed") {
+        "failed"
+    } else if raw_status == "needs_input"
+        || response_status == Some("needs_input")
+        || !questions.is_empty()
+    {
+        "needs_input"
+    } else {
+        "done"
+    }
+    .to_owned();
+    let message = value
+        .get("error")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .or_else(|| {
+            structured_content
+                .as_ref()
+                .and_then(|content| content.get("message"))
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
+        .or(response_content)
+        .or_else(|| Some(status_message(&status).to_owned()));
+
+    TaskUpdate {
+        task_id: optional_string(value.get("task_id")),
+        card_id: value
+            .pointer("/metadata/card_id")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        status,
+        message,
+        questions,
+        error: value
+            .get("error")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        consumer: value
+            .get("consumer")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        source_stream_id: value
+            .get("source_stream_id")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        result_stream_id: Some(result_stream_id.to_owned()),
+        completed_at_ms: value.get("completed_at_ms").and_then(Value::as_u64),
+        response,
+        telegram: value.get("telegram").cloned(),
+    }
+}
+
+fn extract_questions(value: &Value) -> Vec<String> {
+    let direct: Vec<String> = value
+        .get("questions")
+        .or_else(|| value.pointer("/response/questions"))
+        .and_then(Value::as_array)
+        .map(|questions| {
+            questions
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default();
+
+    if !direct.is_empty() {
+        return direct;
+    }
+
+    value
+        .get("response")
+        .and_then(completion_text)
+        .and_then(|content| serde_json::from_str::<Value>(&content).ok())
+        .and_then(|content| content.get("questions").cloned())
+        .and_then(|questions| questions.as_array().cloned())
+        .map(|questions| {
+            questions
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn completion_text(value: &Value) -> Option<String> {
+    value
+        .pointer("/choices/0/message/content")
+        .and_then(Value::as_str)
+        .or_else(|| value.get("output_text").and_then(Value::as_str))
+        .or_else(|| value.get("content").and_then(Value::as_str))
+        .map(str::to_owned)
+}
+
+fn optional_string(value: Option<&Value>) -> Option<String> {
+    value.and_then(|value| match value {
+        Value::String(value) if !value.trim().is_empty() => Some(value.to_owned()),
+        _ => None,
+    })
+}
+
+fn status_message(status: &str) -> &'static str {
+    match status {
+        "done" => "Task completed",
+        "needs_input" => "Task needs more input",
+        "failed" => "Task failed",
+        _ => "Task updated",
+    }
+}
+
+async fn send_json<T: Serialize>(
+    sender: &mut SplitSink<WebSocket, Message>,
+    value: &T,
+) -> Result<()> {
     let text = serde_json::to_string(value).context("failed to serialize websocket response")?;
-    socket
+    sender
         .send(Message::Text(text.into()))
         .await
         .context("failed to send websocket response")

@@ -5,7 +5,7 @@
 This workspace has two Rust services:
 
 - `publisher`: websocket endpoint for the frontend. It accepts chat task JSON and appends it to a Redis Stream.
-- `consumer`: worker process. It registers itself in Redis, blocks on Redis Streams, calls the OpenClaw chat completions endpoint with the gateway token, and appends the result to a result stream.
+- `consumer`: worker process. It registers itself in Redis, blocks on Redis Streams, calls the OpenClaw chat completions endpoint with the gateway token, optionally sends the response to Telegram, and appends the result to a result stream.
 
 Redis Streams are used instead of Redis pub/sub so tasks survive consumer restarts. Assigned work is routed to a per-consumer stream, while unassigned work is routed to the shared task stream.
 
@@ -16,6 +16,13 @@ Start Redis, then run the two services:
 ```sh
 cargo run -p publisher
 CONSUMER_NAME=consumer-1 OPENCLAW_GATEWAY_TOKEN=your-token cargo run -p consumer
+```
+
+To send completed task responses to Telegram, also set:
+
+```sh
+TELEGRAM_BOT_TOKEN=your-bot-token
+TELEGRAM_CHAT_ID=your-chat-id
 ```
 
 The publisher listens on `ws://127.0.0.1:8080/ws` by default.
@@ -97,9 +104,26 @@ Consumer results are written to the `openclaw:results` Redis Stream with a `payl
   "source_stream": "openclaw:tasks:consumer-1",
   "source_stream_id": "redis-stream-entry-id",
   "completed_at_ms": 1779400000000,
+  "telegram": {
+    "status": "sent"
+  },
   "response": {}
 }
 ```
+
+The publisher also watches `RESULT_STREAM` and broadcasts task updates to connected Kanban websocket clients:
+
+```json
+{
+  "type": "task_update",
+  "task_id": "generated-or-provided-task-id",
+  "card_id": "frontend-card-id",
+  "status": "done",
+  "message": "Task completed"
+}
+```
+
+`status: "done"` moves the card to `Done`. `status: "needs_input"` and `status: "failed"` move the card to `Review` and show the message or questions in the card detail panel.
 
 ## Configuration
 
@@ -117,10 +141,15 @@ Environment variables:
 - `CONSUMER_DISCOVERY_TTL_MS`: consumer discovery TTL. Default: `15000`
 - `CONSUMER_HEARTBEAT_INTERVAL_MS`: consumer discovery heartbeat interval. Default: `5000`
 - `CONSUMER_STALE_AFTER_MS`: publisher cutoff for stale consumers. Default: `15000`
+- `RESULT_STREAM_BLOCK_MS`: publisher block timeout when watching results. Default: `5000`
+- `PUBLISHER_UPDATE_BUFFER`: websocket broadcast buffer for task updates. Default: `256`
 - `OPENCLAW_BASE_URL`: used to build `/chat/completions` when `OPENCLAW_CHAT_COMPLETIONS_URL` is unset
 - `OPENCLAW_CHAT_COMPLETIONS_URL`: full chat completions URL
 - `OPENCLAW_GATEWAY_TOKEN`: required by the consumer
 - `OPENCLAW_GATEWAY_TOKEN_HEADER`: default `Authorization`. Set this if the gateway expects a different header.
 - `OPENCLAW_GATEWAY_TOKEN_PREFIX`: optional prefix for non-Authorization token headers
+- `TELEGRAM_API_BASE`: Telegram API base URL. Default: `https://api.telegram.org`
+- `TELEGRAM_BOT_TOKEN`: optional Telegram bot token for sending completed responses
+- `TELEGRAM_CHAT_ID`: optional Telegram chat ID for sending completed responses
 - `VITE_PUBLISHER_WS_URL`: frontend websocket URL. Default: `ws://127.0.0.1:8080/ws`
 - `VITE_DEFAULT_MODEL`: frontend default model. Default: `openclaw-chat`
