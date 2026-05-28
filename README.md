@@ -41,7 +41,7 @@ Send a JSON message like this to the publisher websocket:
 
 ```json
 {
-  "model": "openclaw-chat",
+  "model": "openclaw",
   "assigned_consumer": "consumer-1",
   "messages": [
     { "role": "user", "content": "Write a short summary of Redis Streams." }
@@ -84,6 +84,7 @@ The publisher responds with:
       "task_stream": "openclaw:tasks",
       "direct_task_stream": "openclaw:tasks:consumer-1",
       "result_stream": "openclaw:results",
+      "hostname": "worker-host-1",
       "status": "listening",
       "started_at_ms": 1779400000000,
       "last_seen_ms": 1779400000000,
@@ -138,6 +139,7 @@ Environment variables:
 - `DEFAULT_MODEL`: optional default model if frontend payload omits `model`
 - `CONSUMER_GROUP`: Redis consumer group. Default: `openclaw-workers`
 - `CONSUMER_NAME`: Redis consumer name. Required by the consumer so the publisher can assign tasks.
+- `CONSUMER_HOSTNAME`: optional hostname to publish in consumer discovery. Defaults to `HOSTNAME`, `COMPUTERNAME`, or the `hostname` command when available.
 - `CONSUMER_DISCOVERY_TTL_MS`: consumer discovery TTL. Default: `15000`
 - `CONSUMER_HEARTBEAT_INTERVAL_MS`: consumer discovery heartbeat interval. Default: `5000`
 - `CONSUMER_STALE_AFTER_MS`: publisher cutoff for stale consumers. Default: `15000`
@@ -152,4 +154,4 @@ Environment variables:
 - `TELEGRAM_BOT_TOKEN`: optional Telegram bot token for sending completed responses
 - `TELEGRAM_CHAT_ID`: optional Telegram chat ID for sending completed responses
 - `VITE_PUBLISHER_WS_URL`: frontend websocket URL. Default: `ws://127.0.0.1:8080/ws`
-- `VITE_DEFAULT_MODEL`: frontend default model. Default: `openclaw-chat`
+- `VITE_DEFAULT_MODEL`: frontend default model. Default: `openclaw`

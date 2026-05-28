@@ -5,6 +5,7 @@ import {
   Check,
   Circle,
   ClipboardList,
+  Copy,
   Loader2,
   MessageSquareText,
   Plus,
@@ -21,6 +22,7 @@ import "./styles.css";
 type ColumnId = "backlog" | "ready" | "in_progress" | "review" | "done";
 type Priority = "low" | "medium" | "high";
 type PublishStatus = "draft" | "queued" | "failed" | "done" | "needs_input";
+type PublishKind = "work" | "review";
 type SocketStatus = "closed" | "connecting" | "open";
 
 interface Column {
@@ -31,6 +33,7 @@ interface Column {
 
 interface KanbanCard {
   id: string;
+  taskId: string;
   title: string;
   prompt: string;
   model: string;
@@ -38,10 +41,12 @@ interface KanbanCard {
   priority: Priority;
   assignee: string;
   assignedConsumer: string;
+  requiresReview: boolean;
+  dependsOnTaskId: string;
+  autoPublishOnDependency: boolean;
   dueDate: string;
   tags: string[];
   publishStatus: PublishStatus;
-  taskId?: string;
   streamId?: string;
   error?: string;
   resultMessage?: string;
@@ -49,6 +54,13 @@ interface KanbanCard {
   completedAt?: number;
   questions?: string[];
   completedBy?: string;
+  reviewTaskId?: string;
+  reviewStreamId?: string;
+  reviewConsumer?: string;
+  reviewedBy?: string;
+  reviewError?: string;
+  reviewRequestedAt?: number;
+  reviewCompletedAt?: number;
   createdAt: number;
   updatedAt: number;
   lastPublishedAt?: number;
@@ -62,8 +74,17 @@ interface DraftCard {
   priority: Priority;
   assignee: string;
   assignedConsumer: string;
+  requiresReview: boolean;
+  dependsOnTaskId: string;
+  autoPublishOnDependency: boolean;
   dueDate: string;
   tagsText: string;
+}
+
+interface PublishQueueItem {
+  cardId: string;
+  kind: PublishKind;
+  excludeConsumer?: string;
 }
 
 interface PublisherAccepted {
@@ -83,6 +104,7 @@ interface ConsumerDiscovery {
   task_stream: string;
   direct_task_stream: string;
   result_stream: string;
+  hostname?: string;
   status: string;
   started_at_ms: number;
   last_seen_ms: number;
@@ -98,6 +120,7 @@ interface PublisherTaskUpdate {
   type: "task_update";
   task_id?: string;
   card_id?: string;
+  task_kind?: string;
   status: "done" | "needs_input" | "failed" | string;
   message?: string;
   questions?: string[];
@@ -127,14 +150,17 @@ const priorityLabels: Record<Priority, string> = {
   high: "High"
 };
 
-const defaultModel = import.meta.env.VITE_DEFAULT_MODEL ?? "openclaw-chat";
+const defaultModel = import.meta.env.VITE_DEFAULT_MODEL ?? "openclaw";
 const defaultWsUrl =
   import.meta.env.VITE_PUBLISHER_WS_URL ?? "ws://127.0.0.1:8080/ws";
 const storageKey = "gyne-agent-kanban";
+const singaporeTimeZone = "Asia/Singapore";
+const singaporeTimeZoneLabel = "SGT";
 
 const initialCards: KanbanCard[] = [
   {
     id: crypto.randomUUID(),
+    taskId: crypto.randomUUID(),
     title: "Summarize patient intake notes",
     prompt:
       "Turn the intake notes into a concise clinical handoff with risks, missing data, and next actions.",
@@ -143,6 +169,9 @@ const initialCards: KanbanCard[] = [
     priority: "high",
     assignee: "Ops",
     assignedConsumer: "",
+    requiresReview: false,
+    dependsOnTaskId: "",
+    autoPublishOnDependency: false,
     dueDate: todayPlus(1),
     tags: ["triage", "handoff"],
     publishStatus: "draft",
@@ -151,6 +180,7 @@ const initialCards: KanbanCard[] = [
   },
   {
     id: crypto.randomUUID(),
+    taskId: crypto.randomUUID(),
     title: "Draft follow-up checklist",
     prompt:
       "Create a follow-up checklist for a patient who needs labs, imaging, and medication reconciliation.",
@@ -159,6 +189,9 @@ const initialCards: KanbanCard[] = [
     priority: "medium",
     assignee: "Care Team",
     assignedConsumer: "",
+    requiresReview: false,
+    dependsOnTaskId: "",
+    autoPublishOnDependency: false,
     dueDate: todayPlus(3),
     tags: ["checklist"],
     publishStatus: "draft",
@@ -178,15 +211,19 @@ function App() {
   const [wsUrl, setWsUrl] = React.useState(defaultWsUrl);
   const [socketStatus, setSocketStatus] =
     React.useState<SocketStatus>("closed");
-  const [publishQueue, setPublishQueue] = React.useState<string[]>([]);
+  const [publishQueue, setPublishQueue] = React.useState<PublishQueueItem[]>([]);
   const [pendingCardId, setPendingCardId] = React.useState<string | null>(null);
   const [consumers, setConsumers] = React.useState<ConsumerDiscovery[]>([]);
   const [lastDiscoveryAt, setLastDiscoveryAt] = React.useState<number | null>(null);
   const [lastEvent, setLastEvent] = React.useState("Disconnected");
   const socketRef = React.useRef<WebSocket | null>(null);
   const pendingCardRef = React.useRef<string | null>(null);
-  const queueRef = React.useRef<string[]>([]);
+  const pendingKindRef = React.useRef<PublishKind>("work");
+  const pendingExcludeConsumerRef = React.useRef<string | undefined>(undefined);
+  const pendingAssignedConsumerRef = React.useRef<string | undefined>(undefined);
+  const queueRef = React.useRef<PublishQueueItem[]>([]);
   const cardsRef = React.useRef<KanbanCard[]>(cards);
+  const consumersRef = React.useRef<ConsumerDiscovery[]>(consumers);
 
   const selectedCard = cards.find((card) => card.id === selectedId) ?? null;
   const queuedCount = cards.filter((card) => card.publishStatus === "queued").length;
@@ -196,6 +233,10 @@ function App() {
     localStorage.setItem(storageKey, JSON.stringify(cards));
     cardsRef.current = cards;
   }, [cards]);
+
+  React.useEffect(() => {
+    consumersRef.current = consumers;
+  }, [consumers]);
 
   React.useEffect(() => {
     return () => {
@@ -235,10 +276,9 @@ function App() {
       setLastEvent("Disconnected");
       setConsumers([]);
       socketRef.current = null;
-      pendingCardRef.current = null;
+      clearPendingPublish();
       queueRef.current = [];
       setPublishQueue([]);
-      setPendingCardId(null);
     };
 
     socket.onerror = () => {
@@ -254,13 +294,20 @@ function App() {
   function disconnect() {
     socketRef.current?.close();
     socketRef.current = null;
-    pendingCardRef.current = null;
+    clearPendingPublish();
     queueRef.current = [];
     setPublishQueue([]);
-    setPendingCardId(null);
     setSocketStatus("closed");
     setConsumers([]);
     setLastEvent("Disconnected");
+  }
+
+  function clearPendingPublish() {
+    pendingCardRef.current = null;
+    pendingKindRef.current = "work";
+    pendingExcludeConsumerRef.current = undefined;
+    pendingAssignedConsumerRef.current = undefined;
+    setPendingCardId(null);
   }
 
   function requestConsumers(socket = socketRef.current) {
@@ -279,24 +326,76 @@ function App() {
       return;
     }
 
-    const [nextId, ...remaining] = queueRef.current;
-    if (!nextId) {
+    const [nextItem, ...remaining] = queueRef.current;
+    if (!nextItem) {
       return;
     }
 
     queueRef.current = remaining;
     setPublishQueue(remaining);
 
-    const card = cardsRef.current.find((item) => item.id === nextId);
+    const card = cardsRef.current.find((item) => item.id === nextItem.cardId);
     if (!card) {
       window.setTimeout(() => flushPublishQueue(socket), 0);
       return;
     }
 
-    pendingCardRef.current = nextId;
-    setPendingCardId(nextId);
-    socket.send(JSON.stringify(toPublisherPayload(card)));
-    setLastEvent(`Publishing ${card.title}`);
+    const dependencyBlock =
+      nextItem.kind === "work" ? dependencyBlockMessage(card) : null;
+    if (dependencyBlock) {
+      markCardBlocked(nextItem.cardId, dependencyBlock);
+      window.setTimeout(() => flushPublishQueue(socket), 0);
+      return;
+    }
+
+    const assignedConsumer =
+      nextItem.kind === "review"
+        ? selectReviewConsumer(nextItem.excludeConsumer)
+        : card.assignedConsumer || undefined;
+
+    if (nextItem.kind === "review" && !assignedConsumer) {
+      markCardFailed(
+        nextItem.cardId,
+        "Review requires another active consumer, but none is available.",
+        "review"
+      );
+      window.setTimeout(() => flushPublishQueue(socket), 0);
+      return;
+    }
+
+    pendingCardRef.current = nextItem.cardId;
+    pendingKindRef.current = nextItem.kind;
+    pendingExcludeConsumerRef.current = nextItem.excludeConsumer;
+    pendingAssignedConsumerRef.current = assignedConsumer;
+    setPendingCardId(nextItem.cardId);
+    setCards((current) =>
+      current.map((item) =>
+        item.id === nextItem.cardId
+          ? {
+              ...item,
+              column: nextItem.kind === "review" ? "review" : "in_progress",
+              publishStatus: "queued",
+              error: undefined,
+              reviewError: nextItem.kind === "review" ? undefined : item.reviewError,
+              updatedAt: Date.now()
+            }
+          : item
+      )
+    );
+    socket.send(
+      JSON.stringify(
+        toPublisherPayload(card, {
+          kind: nextItem.kind,
+          assignedConsumer,
+          excludeConsumer: nextItem.excludeConsumer
+        })
+      )
+    );
+    setLastEvent(
+      nextItem.kind === "review"
+        ? `Routing review for ${card.title}`
+        : `Publishing ${card.title}`
+    );
   }
 
   React.useEffect(() => {
@@ -327,8 +426,9 @@ function App() {
     }
 
     const pendingId = pendingCardRef.current;
-    pendingCardRef.current = null;
-    setPendingCardId(null);
+    const pendingKind = pendingKindRef.current;
+    const pendingAssignedConsumer = pendingAssignedConsumerRef.current;
+    clearPendingPublish();
 
     if (!pendingId) {
       setLastEvent("Publisher response received");
@@ -339,42 +439,79 @@ function App() {
       setCards((current) =>
         current.map((card) =>
           card.id === pendingId
-            ? {
-                ...card,
-                publishStatus: "queued",
-                taskId: response.task_id,
-                streamId: response.stream_id,
-                error: undefined,
-                lastPublishedAt: Date.now(),
-                updatedAt: Date.now()
-              }
+            ? pendingKind === "review"
+              ? {
+                  ...card,
+                  column: "review",
+                  publishStatus: "queued",
+                  reviewTaskId: response.task_id,
+                  reviewStreamId: response.stream_id,
+                  reviewConsumer: pendingAssignedConsumer,
+                  reviewError: undefined,
+                  error: undefined,
+                  reviewRequestedAt: Date.now(),
+                  lastPublishedAt: Date.now(),
+                  updatedAt: Date.now()
+                }
+              : {
+                  ...card,
+                  publishStatus: "queued",
+                  taskId: response.task_id,
+                  streamId: response.stream_id,
+                  error: undefined,
+                  lastPublishedAt: Date.now(),
+                  updatedAt: Date.now()
+                }
             : card
         )
       );
-      setLastEvent(`Queued ${response.task_id}`);
+      setLastEvent(
+        pendingKind === "review"
+          ? `Review queued ${response.task_id}`
+          : `Queued ${response.task_id}`
+      );
     } else {
-      markCardFailed(pendingId, response.message);
+      markCardFailed(pendingId, response.message, pendingKind);
     }
   }
 
   function markPendingFailed(message: string) {
     const pendingId = pendingCardRef.current;
-    pendingCardRef.current = null;
-    setPendingCardId(null);
+    const pendingKind = pendingKindRef.current;
+    clearPendingPublish();
     if (pendingId) {
-      markCardFailed(pendingId, message);
+      markCardFailed(pendingId, message, pendingKind);
     } else {
       setLastEvent(message);
     }
   }
 
-  function markCardFailed(cardId: string, message: string) {
+  function markCardFailed(cardId: string, message: string, kind: PublishKind = "work") {
     setCards((current) =>
       current.map((card) =>
         card.id === cardId
           ? {
               ...card,
+              column: kind === "review" ? "review" : card.column,
               publishStatus: "failed",
+              error: message,
+              reviewError: kind === "review" ? message : card.reviewError,
+              updatedAt: Date.now()
+            }
+          : card
+      )
+    );
+    setLastEvent(message);
+  }
+
+  function markCardBlocked(cardId: string, message: string) {
+    setCards((current) =>
+      current.map((card) =>
+        card.id === cardId
+          ? {
+              ...card,
+              column: "backlog",
+              publishStatus: "draft",
               error: message,
               updatedAt: Date.now()
             }
@@ -385,25 +522,72 @@ function App() {
   }
 
   function applyTaskUpdate(update: PublisherTaskUpdate) {
-    const matched = cardsRef.current.some(
-      (card) =>
-        (update.card_id && card.id === update.card_id) ||
-        (update.task_id && card.taskId === update.task_id)
-    );
-    setCards((current) =>
-      current.map((card) => {
-        const isMatch =
-          (update.card_id && card.id === update.card_id) ||
-          (update.task_id && card.taskId === update.task_id);
-        if (!isMatch) {
+    const matchedCard = cardsRef.current.find((card) => taskUpdateKind(card, update));
+    const updateKind = matchedCard ? taskUpdateKind(matchedCard, update) : null;
+    const status = normalizeUpdateStatus(update.status);
+    const shouldRouteReview =
+      matchedCard &&
+      updateKind === "work" &&
+      status === "done" &&
+      matchedCard.requiresReview &&
+      !matchedCard.reviewTaskId &&
+      !matchedCard.reviewCompletedAt &&
+      !isQueuedOrPending(matchedCard.id, "review");
+    const completedDependencyTaskId =
+      matchedCard &&
+      status === "done" &&
+      (updateKind === "review" || (updateKind === "work" && !shouldRouteReview))
+        ? matchedCard.taskId
+        : undefined;
+    const autoPublishIds = completedDependencyTaskId
+      ? cardsRef.current
+          .filter(
+            (card) =>
+              card.column === "backlog" &&
+              card.dependsOnTaskId === completedDependencyTaskId &&
+              card.autoPublishOnDependency &&
+              !isPublishing(card)
+          )
+          .map((card) => card.id)
+      : [];
+
+    setCards((current) => {
+      const updatedCards = current.map((card) => {
+        const kind = taskUpdateKind(card, update);
+        if (!kind) {
           return card;
         }
 
-        const status = normalizeUpdateStatus(update.status);
+        if (kind === "review") {
+          return {
+            ...card,
+            column: columnForReviewUpdateStatus(status),
+            publishStatus: status,
+            error: status === "failed" ? update.error || update.message : undefined,
+            reviewError:
+              status === "failed" || status === "needs_input"
+                ? update.error || update.message
+                : undefined,
+            resultMessage: update.message,
+            resultStreamId: update.result_stream_id,
+            questions: update.questions ?? [],
+            reviewedBy: update.consumer,
+            reviewCompletedAt: update.completed_at_ms,
+            updatedAt: Date.now()
+          };
+        }
+
+        const routeReview =
+          status === "done" &&
+          card.requiresReview &&
+          !card.reviewTaskId &&
+          !card.reviewCompletedAt &&
+          !isQueuedOrPending(card.id, "review");
+
         return {
           ...card,
-          column: columnForUpdateStatus(status, card.column),
-          publishStatus: status,
+          column: routeReview ? "review" : columnForUpdateStatus(status, card.column),
+          publishStatus: routeReview ? "queued" : status,
           error: status === "failed" ? update.error || update.message : undefined,
           resultMessage: update.message,
           resultStreamId: update.result_stream_id,
@@ -412,11 +596,27 @@ function App() {
           completedBy: update.consumer,
           updatedAt: Date.now()
         };
-      })
-    );
+      });
+
+      if (!completedDependencyTaskId) {
+        return updatedCards;
+      }
+
+      return releaseDependentCards(updatedCards, completedDependencyTaskId);
+    });
+
+    if (shouldRouteReview && matchedCard) {
+      enqueueCards([matchedCard.id], "review", update.consumer);
+    }
+    if (autoPublishIds.length > 0) {
+      enqueueCards(autoPublishIds, "work");
+      if (socketStatus === "closed") {
+        connect();
+      }
+    }
 
     setLastEvent(
-      matched
+      matchedCard
         ? update.message || statusText(update.status)
         : `Update for ${update.task_id ?? "unknown task"}`
     );
@@ -437,6 +637,9 @@ function App() {
       priority: card.priority,
       assignee: card.assignee,
       assignedConsumer: card.assignedConsumer,
+      requiresReview: card.requiresReview,
+      dependsOnTaskId: card.dependsOnTaskId,
+      autoPublishOnDependency: card.autoPublishOnDependency,
       dueDate: card.dueDate,
       tagsText: card.tags.join(", ")
     });
@@ -467,10 +670,13 @@ function App() {
                 priority: draft.priority,
                 assignee: draft.assignee.trim(),
                 assignedConsumer: draft.assignedConsumer,
+                requiresReview: draft.requiresReview,
+                dependsOnTaskId: draft.column === "backlog" ? draft.dependsOnTaskId : "",
+                autoPublishOnDependency:
+                  draft.column === "backlog" ? draft.autoPublishOnDependency : false,
                 dueDate: draft.dueDate,
                 tags,
                 publishStatus: card.publishStatus === "queued" ? "draft" : card.publishStatus,
-                taskId: undefined,
                 streamId: undefined,
                 error: undefined,
                 resultMessage: undefined,
@@ -478,6 +684,13 @@ function App() {
                 completedAt: undefined,
                 questions: undefined,
                 completedBy: undefined,
+                reviewTaskId: undefined,
+                reviewStreamId: undefined,
+                reviewConsumer: undefined,
+                reviewedBy: undefined,
+                reviewError: undefined,
+                reviewRequestedAt: undefined,
+                reviewCompletedAt: undefined,
                 lastPublishedAt: undefined,
                 updatedAt: Date.now()
               }
@@ -487,6 +700,7 @@ function App() {
     } else {
       const card: KanbanCard = {
         id: crypto.randomUUID(),
+        taskId: crypto.randomUUID(),
         title: trimmedTitle,
         prompt: trimmedPrompt,
         model: draft.model.trim() || defaultModel,
@@ -494,6 +708,10 @@ function App() {
         priority: draft.priority,
         assignee: draft.assignee.trim(),
         assignedConsumer: draft.assignedConsumer,
+        requiresReview: draft.requiresReview,
+        dependsOnTaskId: draft.column === "backlog" ? draft.dependsOnTaskId : "",
+        autoPublishOnDependency:
+          draft.column === "backlog" ? draft.autoPublishOnDependency : false,
         dueDate: draft.dueDate,
         tags,
         publishStatus: "draft",
@@ -509,7 +727,7 @@ function App() {
 
   function deleteCard(cardId: string) {
     setCards((current) => current.filter((card) => card.id !== cardId));
-    queueRef.current = queueRef.current.filter((id) => id !== cardId);
+    queueRef.current = queueRef.current.filter((item) => item.cardId !== cardId);
     setPublishQueue(queueRef.current);
     if (selectedId === cardId) {
       setSelectedId(null);
@@ -536,6 +754,12 @@ function App() {
       return;
     }
 
+    const dependencyBlock = dependencyBlockMessage(card);
+    if (dependencyBlock) {
+      markCardBlocked(cardId, dependencyBlock);
+      return;
+    }
+
     setCards((current) =>
       current.map((item) =>
         item.id === cardId
@@ -543,12 +767,19 @@ function App() {
               ...item,
               publishStatus: "draft",
               error: undefined,
+              reviewTaskId: undefined,
+              reviewStreamId: undefined,
+              reviewConsumer: undefined,
+              reviewedBy: undefined,
+              reviewError: undefined,
+              reviewRequestedAt: undefined,
+              reviewCompletedAt: undefined,
               updatedAt: Date.now()
             }
           : item
       )
     );
-    enqueueCards([cardId]);
+    enqueueCards([cardId], "work");
 
     if (socketStatus === "closed") {
       connect();
@@ -556,38 +787,107 @@ function App() {
   }
 
   function publishColumn(column: ColumnId) {
-    const ids = cards
-      .filter((card) => card.column === column && !isPublishing(card))
+    const candidates = cards.filter((card) => card.column === column && !isPublishing(card));
+    const blocked = candidates
+      .map((card) => ({ card, message: dependencyBlockMessage(card) }))
+      .filter((item): item is { card: KanbanCard; message: string } => Boolean(item.message));
+    if (blocked.length > 0) {
+      setCards((current) =>
+        current.map((card) => {
+          const blockedItem = blocked.find((item) => item.card.id === card.id);
+          return blockedItem
+            ? {
+                ...card,
+                column: "backlog",
+                publishStatus: "draft",
+                error: blockedItem.message,
+                updatedAt: Date.now()
+              }
+            : card;
+        })
+      );
+      setLastEvent(`${blocked.length} task${blocked.length === 1 ? "" : "s"} waiting on dependencies`);
+    }
+
+    const ids = candidates
+      .filter((card) => !dependencyBlockMessage(card))
       .map((card) => card.id);
     if (ids.length === 0) {
       return;
     }
-    enqueueCards(ids);
+    enqueueCards(ids, "work");
     if (socketStatus === "closed") {
       connect();
     }
   }
 
-  function enqueueCards(cardIds: string[]) {
-    const existing = new Set(queueRef.current);
-    const nextIds = cardIds.filter(
-      (cardId) => !existing.has(cardId) && pendingCardRef.current !== cardId
-    );
-    if (nextIds.length === 0) {
+  function enqueueCards(
+    cardIds: string[],
+    kind: PublishKind,
+    excludeConsumer?: string
+  ) {
+    const existing = new Set(queueRef.current.map(queueItemKey));
+    const nextItems = cardIds
+      .map((cardId) => ({ cardId, kind, excludeConsumer }))
+      .filter(
+        (item) =>
+          !existing.has(queueItemKey(item)) &&
+          !(pendingCardRef.current === item.cardId && pendingKindRef.current === item.kind)
+      );
+    if (nextItems.length === 0) {
       return;
     }
 
-    queueRef.current = [...queueRef.current, ...nextIds];
+    queueRef.current = [...queueRef.current, ...nextItems];
     setPublishQueue(queueRef.current);
   }
 
   function isPublishing(card: KanbanCard) {
     return (
       card.publishStatus === "queued" ||
-      publishQueue.includes(card.id) ||
+      publishQueue.some((item) => item.cardId === card.id) ||
       pendingCardId === card.id ||
       pendingCardRef.current === card.id
     );
+  }
+
+  function isQueuedOrPending(cardId: string, kind?: PublishKind) {
+    return (
+      queueRef.current.some(
+        (item) => item.cardId === cardId && (!kind || item.kind === kind)
+      ) ||
+      (pendingCardRef.current === cardId && (!kind || pendingKindRef.current === kind))
+    );
+  }
+
+  function selectReviewConsumer(excludeConsumer?: string) {
+    return consumersRef.current.find((consumer) => consumer.name !== excludeConsumer)?.name;
+  }
+
+  function dependencyBlockMessage(card: KanbanCard) {
+    if (!card.dependsOnTaskId) {
+      return null;
+    }
+
+    const dependency = cardsRef.current.find(
+      (item) => item.taskId === card.dependsOnTaskId
+    );
+    if (!dependency) {
+      return "Waiting for dependency, but the referenced task was not found.";
+    }
+    if (isDoneCard(dependency)) {
+      return null;
+    }
+    return `Waiting for dependency: ${dependency.title}`;
+  }
+
+  async function copyTaskId(taskId: string) {
+    try {
+      await navigator.clipboard.writeText(taskId);
+      setLastEvent("Task ID copied");
+    } catch {
+      setLastEvent("Could not copy task ID");
+    }
   }
 
   function onDrop(column: ColumnId) {
@@ -606,7 +906,10 @@ function App() {
           </div>
           <div>
             <h1>Gyne Agent Kanban</h1>
-            <p>{cards.length} cards · {queuedCount} queued · {connectedConsumerCount} consumers</p>
+            <p>
+              {cards.length} cards · {queuedCount} queued · {connectedConsumerCount} consumers ·{" "}
+              {singaporeTimeZoneLabel}
+            </p>
           </div>
         </div>
 
@@ -714,6 +1017,7 @@ function App() {
                 <div className="consumer-row" key={consumer.name}>
                   <div>
                     <strong>{consumer.name}</strong>
+                    <span>{consumer.hostname || "Hostname unavailable"}</span>
                     <span>{consumer.consumer_group}</span>
                   </div>
                   <span>{consumer.status}</span>
@@ -746,9 +1050,39 @@ function App() {
               <Field label="Priority" value={priorityLabels[selectedCard.priority]} />
               <Field label="Owner" value={selectedCard.assignee || "Unassigned"} />
               <Field label="Consumer" value={selectedCard.assignedConsumer || "Auto"} />
+              <Field label="Review" value={selectedCard.requiresReview ? "Required" : "Off"} />
               <Field label="Completed By" value={selectedCard.completedBy || "None"} />
+              <Field
+                label="Completed At"
+                value={selectedCard.completedAt ? formatTime(selectedCard.completedAt) : "None"}
+              />
+              <Field
+                label="Reviewer"
+                value={
+                  selectedCard.reviewedBy || selectedCard.reviewConsumer || "None"
+                }
+              />
+              <Field
+                label="Reviewed At"
+                value={
+                  selectedCard.reviewCompletedAt
+                    ? formatTime(selectedCard.reviewCompletedAt)
+                    : "None"
+                }
+              />
+              <Field
+                label="Depends On"
+                value={dependencyLabel(cards, selectedCard.dependsOnTaskId)}
+              />
+              <Field
+                label="Auto Publish"
+                value={selectedCard.autoPublishOnDependency ? "On" : "Off"}
+              />
               <Field label="Due" value={selectedCard.dueDate || "None"} />
-              <Field label="Task ID" value={selectedCard.taskId ?? "Not queued"} />
+              <TaskIdField
+                taskId={selectedCard.taskId}
+                onCopy={() => copyTaskId(selectedCard.taskId)}
+              />
               <Field label="Result ID" value={selectedCard.resultStreamId ?? "None"} />
             </div>
             <div className="prompt-panel">
@@ -837,12 +1171,16 @@ function App() {
                 <span>Column</span>
                 <select
                   value={draft.column}
-                  onChange={(event) =>
+                  onChange={(event) => {
+                    const column = event.target.value as ColumnId;
                     setDraft((current) => ({
                       ...current,
-                      column: event.target.value as ColumnId
-                    }))
-                  }
+                      column,
+                      dependsOnTaskId: column === "backlog" ? current.dependsOnTaskId : "",
+                      autoPublishOnDependency:
+                        column === "backlog" ? current.autoPublishOnDependency : false
+                    }));
+                  }}
                 >
                   {columns.map((column) => (
                     <option key={column.id} value={column.id}>
@@ -852,6 +1190,61 @@ function App() {
                 </select>
               </label>
             </div>
+
+            {draft.column === "backlog" ? (
+              <div className="dependency-fields">
+                <label>
+                  <span>Dependency Task ID</span>
+                  <input
+                    value={draft.dependsOnTaskId}
+                    placeholder="Paste a task UUID"
+                    onChange={(event) =>
+                      setDraft((current) => ({
+                        ...current,
+                        dependsOnTaskId: event.target.value.trim()
+                      }))
+                    }
+                  />
+                </label>
+
+                <label>
+                  <span>Pick Existing Task</span>
+                  <select
+                    value={draft.dependsOnTaskId}
+                    onChange={(event) =>
+                      setDraft((current) => ({
+                        ...current,
+                        dependsOnTaskId: event.target.value
+                      }))
+                    }
+                  >
+                    <option value="">None</option>
+                    {cards
+                      .filter((card) => card.id !== selectedId)
+                      .map((card) => (
+                        <option key={card.id} value={card.taskId}>
+                          {card.title}
+                        </option>
+                      ))}
+                  </select>
+                </label>
+
+                <label className="checkbox-field">
+                  <input
+                    type="checkbox"
+                    checked={draft.autoPublishOnDependency}
+                    disabled={!draft.dependsOnTaskId}
+                    onChange={(event) =>
+                      setDraft((current) => ({
+                        ...current,
+                        autoPublishOnDependency: event.target.checked
+                      }))
+                    }
+                  />
+                  <span>Publish automatically when dependency is done</span>
+                </label>
+              </div>
+            ) : null}
 
             <div className="form-row">
               <label>
@@ -931,6 +1324,20 @@ function App() {
                   </option>
                 ))}
               </select>
+            </label>
+
+            <label className="checkbox-field">
+              <input
+                type="checkbox"
+                checked={draft.requiresReview}
+                onChange={(event) =>
+                  setDraft((current) => ({
+                    ...current,
+                    requiresReview: event.target.checked
+                  }))
+                }
+              />
+              <span>Route completion to another consumer for review</span>
             </label>
 
             <footer>
@@ -1084,28 +1491,80 @@ function Field({ label, value }: { label: string; value: string }) {
   );
 }
 
-function toPublisherPayload(card: KanbanCard) {
+function TaskIdField({
+  taskId,
+  onCopy
+}: {
+  taskId: string;
+  onCopy: () => void;
+}) {
+  return (
+    <div className="field task-id-field">
+      <span>Task ID</span>
+      <div>
+        <strong>{taskId}</strong>
+        <button
+          type="button"
+          className="icon-button"
+          onClick={onCopy}
+          aria-label="Copy task ID"
+        >
+          <Copy size={15} />
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function toPublisherPayload(
+  card: KanbanCard,
+  options: {
+    kind: PublishKind;
+    assignedConsumer?: string;
+    excludeConsumer?: string;
+  }
+) {
+  const isReview = options.kind === "review";
+  const assignedConsumer = options.assignedConsumer || card.assignedConsumer || undefined;
+
   return {
-    task_id: card.taskId,
+    task_id: isReview ? undefined : card.taskId,
     model: card.model,
-    assigned_consumer: card.assignedConsumer || undefined,
+    assigned_consumer: assignedConsumer,
     messages: [
       {
         role: "user",
-        content: `${card.title}\n\n${card.prompt}`
+        content: isReview ? reviewPrompt(card) : `${card.title}\n\n${card.prompt}`
       }
     ],
     metadata: {
       card_id: card.id,
+      task_kind: options.kind,
       title: card.title,
       column: card.column,
       priority: card.priority,
       assignee: card.assignee,
-      assigned_consumer: card.assignedConsumer || null,
+      assigned_consumer: assignedConsumer || null,
+      original_consumer: options.excludeConsumer || card.completedBy || null,
+      requires_review: card.requiresReview,
+      review_of_task_id: isReview ? card.taskId ?? null : null,
+      depends_on_task_id: card.dependsOnTaskId || null,
+      auto_publish_on_dependency: card.autoPublishOnDependency,
       due_date: card.dueDate,
       tags: card.tags
     }
   };
+}
+
+function reviewPrompt(card: KanbanCard) {
+  const result = card.resultMessage?.trim() || "No result was captured.";
+  return [
+    "Review the completed task below.",
+    "Check accuracy, completeness, missing risks, and whether the answer follows the prompt. Return a concise review with any required corrections.",
+    `Task title:\n${card.title}`,
+    `Original prompt:\n${card.prompt}`,
+    `Original result:\n${result}`
+  ].join("\n\n");
 }
 
 function loadCards() {
@@ -1117,7 +1576,14 @@ function loadCards() {
   try {
     const parsed = JSON.parse(stored) as KanbanCard[];
     return Array.isArray(parsed)
-      ? parsed.map((card) => ({ ...card, assignedConsumer: card.assignedConsumer ?? "" }))
+      ? parsed.map((card) => ({
+          ...card,
+          taskId: card.taskId ?? crypto.randomUUID(),
+          assignedConsumer: card.assignedConsumer ?? "",
+          requiresReview: Boolean(card.requiresReview),
+          dependsOnTaskId: card.dependsOnTaskId ?? "",
+          autoPublishOnDependency: Boolean(card.autoPublishOnDependency)
+        }))
       : initialCards;
   } catch {
     return initialCards;
@@ -1133,9 +1599,64 @@ function newDraft(): DraftCard {
     priority: "medium",
     assignee: "",
     assignedConsumer: "",
+    requiresReview: false,
+    dependsOnTaskId: "",
+    autoPublishOnDependency: false,
     dueDate: todayPlus(2),
     tagsText: ""
   };
+}
+
+function queueItemKey(item: PublishQueueItem) {
+  return `${item.kind}:${item.cardId}`;
+}
+
+function isDoneCard(card: KanbanCard) {
+  return card.column === "done" && card.publishStatus === "done";
+}
+
+function dependencyLabel(cards: KanbanCard[], dependsOnTaskId: string) {
+  if (!dependsOnTaskId) {
+    return "None";
+  }
+
+  const dependency = cards.find((card) => card.taskId === dependsOnTaskId);
+  return dependency ? dependency.title : "Missing task";
+}
+
+function releaseDependentCards(cards: KanbanCard[], completedTaskId: string) {
+  return cards.map((card) =>
+    card.column === "backlog" && card.dependsOnTaskId === completedTaskId
+      ? {
+          ...card,
+          column: "ready" as ColumnId,
+          error: undefined,
+          updatedAt: Date.now()
+        }
+      : card
+  );
+}
+
+function taskUpdateKind(
+  card: KanbanCard,
+  update: PublisherTaskUpdate
+): PublishKind | null {
+  if (update.card_id && card.id === update.card_id && update.task_kind === "review") {
+    return "review";
+  }
+  if (update.card_id && card.id === update.card_id && update.task_kind === "work") {
+    return "work";
+  }
+  if (update.task_id && card.reviewTaskId === update.task_id) {
+    return "review";
+  }
+  if (update.task_id && card.taskId === update.task_id) {
+    return "work";
+  }
+  if (update.card_id && card.id === update.card_id) {
+    return "work";
+  }
+  return null;
 }
 
 function parseTags(value: string) {
@@ -1168,6 +1689,13 @@ function columnForUpdateStatus(status: PublishStatus, currentColumn: ColumnId): 
   return currentColumn;
 }
 
+function columnForReviewUpdateStatus(status: PublishStatus): ColumnId {
+  if (status === "done") {
+    return "done";
+  }
+  return "review";
+}
+
 function statusText(status: string) {
   if (status === "done" || status === "completed") {
     return "Task completed";
@@ -1182,16 +1710,24 @@ function statusText(status: string) {
 }
 
 function todayPlus(days: number) {
-  const date = new Date();
-  date.setDate(date.getDate() + days);
-  return date.toISOString().slice(0, 10);
+  const date = new Date(Date.now() + days * 24 * 60 * 60 * 1000);
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone: singaporeTimeZone,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit"
+  }).formatToParts(date);
+  const value = (type: string) => parts.find((part) => part.type === type)?.value ?? "";
+  return `${value("year")}-${value("month")}-${value("day")}`;
 }
 
 function formatTime(value: number) {
-  return new Intl.DateTimeFormat(undefined, {
+  return new Intl.DateTimeFormat("en-SG", {
+    timeZone: singaporeTimeZone,
     hour: "2-digit",
     minute: "2-digit",
-    second: "2-digit"
+    second: "2-digit",
+    timeZoneName: "short"
   }).format(value);
 }
 

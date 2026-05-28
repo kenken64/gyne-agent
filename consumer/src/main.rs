@@ -5,7 +5,7 @@ use redis::{
 };
 use reqwest::header::{HeaderName, HeaderValue};
 use serde_json::{json, Value};
-use std::{env, str::FromStr, time::Duration};
+use std::{env, process::Command, str::FromStr, time::Duration};
 use task_core::{now_millis, ChatCompletionRequest, ChatTask, ConsumerDiscovery};
 use tracing::{error, info, warn};
 
@@ -15,6 +15,7 @@ struct Config {
     task_stream: String,
     direct_task_stream: String,
     result_stream: String,
+    hostname: Option<String>,
     consumer_group: String,
     consumer_name: String,
     consumer_registry_key: String,
@@ -358,6 +359,8 @@ async fn publish_discovery(
         .arg(&discovery.direct_task_stream)
         .arg("result_stream")
         .arg(&discovery.result_stream)
+        .arg("hostname")
+        .arg(discovery.hostname.as_deref().unwrap_or(""))
         .arg("status")
         .arg(&discovery.status)
         .arg("started_at_ms")
@@ -446,6 +449,7 @@ impl Config {
             task_stream,
             direct_task_stream,
             result_stream: env_or("RESULT_STREAM", "openclaw:results"),
+            hostname: configured_hostname(),
             consumer_group: env_or("CONSUMER_GROUP", "openclaw-workers"),
             consumer_name,
             consumer_registry_key: env_or("CONSUMER_REGISTRY_KEY", "openclaw:consumers"),
@@ -471,6 +475,7 @@ impl Config {
             task_stream: self.task_stream.clone(),
             direct_task_stream: self.direct_task_stream.clone(),
             result_stream: self.result_stream.clone(),
+            hostname: self.hostname.clone(),
             status: status.to_owned(),
             started_at_ms: self.started_at_ms,
             last_seen_ms,
@@ -523,6 +528,25 @@ fn env_or(key: &str, default: &str) -> String {
 
 fn optional_env(key: &str) -> Option<String> {
     env::var(key).ok().filter(|value| !value.trim().is_empty())
+}
+
+fn configured_hostname() -> Option<String> {
+    optional_env("CONSUMER_HOSTNAME")
+        .or_else(|| optional_env("HOSTNAME"))
+        .or_else(|| optional_env("COMPUTERNAME"))
+        .or_else(system_hostname)
+}
+
+fn system_hostname() -> Option<String> {
+    let output = Command::new("hostname").output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+
+    String::from_utf8(output.stdout)
+        .ok()
+        .map(|hostname| hostname.trim().to_owned())
+        .filter(|hostname| !hostname.is_empty())
 }
 
 fn consumer_discovery_key(registry_key: &str, name: &str) -> String {

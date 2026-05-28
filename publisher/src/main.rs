@@ -230,6 +230,7 @@ async fn handle_client_payload_inner(
     let task = request
         .into_task(state.default_model.as_deref())
         .context("invalid task payload")?;
+    validate_review_assignment(&task)?;
     let task_id = task.task_id.clone();
     let publish_stream = task_publish_stream(redis, state, &task).await?;
     let serialized = serde_json::to_string(&task).context("failed to serialize task")?;
@@ -244,6 +245,32 @@ async fn handle_client_payload_inner(
         .context("failed to append task to Redis stream")?;
 
     Ok(PublisherResponse::Accepted { task_id, stream_id })
+}
+
+fn validate_review_assignment(task: &task_core::ChatTask) -> Result<()> {
+    let Some(metadata) = task.metadata.as_ref() else {
+        return Ok(());
+    };
+    let is_review = metadata
+        .get("task_kind")
+        .and_then(Value::as_str)
+        .is_some_and(|kind| kind == "review");
+    if !is_review {
+        return Ok(());
+    }
+
+    let Some(assigned_consumer) = task.assigned_consumer.as_deref() else {
+        anyhow::bail!("review tasks require an assigned consumer");
+    };
+    let original_consumer = metadata
+        .get("original_consumer")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if !original_consumer.is_empty() && original_consumer == assigned_consumer {
+        anyhow::bail!("review tasks must be assigned to a different consumer");
+    }
+
+    Ok(())
 }
 
 async fn task_publish_stream(
@@ -324,6 +351,10 @@ fn discovery_from_hash(fields: HashMap<String, String>) -> Option<ConsumerDiscov
         task_stream: fields.get("task_stream")?.to_owned(),
         direct_task_stream: fields.get("direct_task_stream")?.to_owned(),
         result_stream: fields.get("result_stream")?.to_owned(),
+        hostname: fields
+            .get("hostname")
+            .map(|hostname| hostname.trim().to_owned())
+            .filter(|hostname| !hostname.is_empty()),
         status: fields.get("status")?.to_owned(),
         started_at_ms: fields.get("started_at_ms")?.parse().ok()?,
         last_seen_ms: fields.get("last_seen_ms")?.parse().ok()?,
@@ -449,6 +480,10 @@ fn result_update_from_value(result_stream_id: &str, value: &Value) -> TaskUpdate
         task_id: optional_string(value.get("task_id")),
         card_id: value
             .pointer("/metadata/card_id")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        task_kind: value
+            .pointer("/metadata/task_kind")
             .and_then(Value::as_str)
             .map(str::to_owned),
         status,

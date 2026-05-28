@@ -462,6 +462,28 @@ p {
   white-space: nowrap;
 }
 
+.task-id-field {
+  grid-column: 1 / -1;
+}
+
+.task-id-field div {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.task-id-field strong {
+  flex: 1;
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+
+.task-id-field .icon-button {
+  width: 32px;
+  min-height: 32px;
+}
+
 .consumer-panel,
 .prompt-panel,
 .result-panel,
@@ -614,6 +636,26 @@ p {
   gap: 6px;
 }
 
+.editor .checkbox-field {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-height: 38px;
+  padding: 9px 10px;
+  border: 1px solid #d9dee8;
+  border-radius: 7px;
+  background: #fbfcfe;
+}
+
+.editor .checkbox-field input {
+  width: 18px;
+  min-height: 18px;
+  padding: 0;
+  border: 0;
+  box-shadow: none;
+  accent-color: #1f6feb;
+}
+
 .editor label span {
   color: #485269;
   font-size: 13px;
@@ -628,6 +670,11 @@ p {
 .form-row {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.dependency-fields {
+  display: grid;
   gap: 12px;
 }
 

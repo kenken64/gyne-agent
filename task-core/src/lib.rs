@@ -60,6 +60,8 @@ pub struct ConsumerDiscovery {
     pub task_stream: String,
     pub direct_task_stream: String,
     pub result_stream: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hostname: Option<String>,
     pub status: String,
     pub started_at_ms: u64,
     pub last_seen_ms: u64,
@@ -72,6 +74,8 @@ pub struct TaskUpdate {
     pub task_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub card_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub task_kind: Option<String>,
     pub status: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
