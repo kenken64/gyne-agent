@@ -444,7 +444,15 @@ p {
   overflow-wrap: anywhere;
 }
 
-.detail-heading .primary-button {
+.detail-heading-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  justify-self: start;
+}
+
+.detail-heading .primary-button,
+.detail-heading-actions .secondary-button {
   justify-self: start;
   white-space: nowrap;
 }
@@ -640,6 +648,16 @@ p {
 
 .editor h2 {
   font-size: 18px;
+}
+
+.editor-hint {
+  margin: -4px 0 4px;
+  padding: 10px 12px;
+  border-radius: 8px;
+  background: rgba(37, 99, 235, 0.08);
+  color: #1d4ed8;
+  font-size: 13px;
+  line-height: 1.4;
 }
 
 .editor label {

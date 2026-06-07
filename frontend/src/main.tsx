@@ -10,6 +10,7 @@ import {
   MessageSquareText,
   Plus,
   RefreshCw,
+  RotateCcw,
   Send,
   Trash2,
   Users,
@@ -207,6 +208,7 @@ function App() {
   );
   const [draft, setDraft] = React.useState<DraftCard>(newDraft());
   const [isEditorOpen, setIsEditorOpen] = React.useState(false);
+  const [reworkMode, setReworkMode] = React.useState(false);
   const [draggedId, setDraggedId] = React.useState<string | null>(null);
   const [wsUrl, setWsUrl] = React.useState(defaultWsUrl);
   const [socketStatus, setSocketStatus] =
@@ -625,6 +627,7 @@ function App() {
   function openNewCard(column: ColumnId) {
     setDraft({ ...newDraft(), column });
     setSelectedId(null);
+    setReworkMode(false);
     setIsEditorOpen(true);
   }
 
@@ -644,6 +647,30 @@ function App() {
       tagsText: card.tags.join(", ")
     });
     setSelectedId(card.id);
+    setReworkMode(false);
+    setIsEditorOpen(true);
+  }
+
+  // Reroute a finished task back to Backlog as a clean draft so its prompt can
+  // be fixed and re-run. On save (see saveDraft) the card gets a fresh task id
+  // and its publish status resets to "draft"; the stale result is cleared.
+  function openReworkCard(card: KanbanCard) {
+    setDraft({
+      title: card.title,
+      prompt: card.prompt,
+      model: card.model,
+      column: "backlog",
+      priority: card.priority,
+      assignee: card.assignee,
+      assignedConsumer: card.assignedConsumer,
+      requiresReview: card.requiresReview,
+      dependsOnTaskId: card.dependsOnTaskId,
+      autoPublishOnDependency: card.autoPublishOnDependency,
+      dueDate: card.dueDate,
+      tagsText: card.tags.join(", ")
+    });
+    setSelectedId(card.id);
+    setReworkMode(true);
     setIsEditorOpen(true);
   }
 
@@ -676,7 +703,10 @@ function App() {
                   draft.column === "backlog" ? draft.autoPublishOnDependency : false,
                 dueDate: draft.dueDate,
                 tags,
-                publishStatus: card.publishStatus === "queued" ? "draft" : card.publishStatus,
+                // Rework re-runs as a brand new task: fresh id, clean draft status.
+                taskId: reworkMode ? crypto.randomUUID() : card.taskId,
+                publishStatus:
+                  reworkMode || card.publishStatus === "queued" ? "draft" : card.publishStatus,
                 streamId: undefined,
                 error: undefined,
                 resultMessage: undefined,
@@ -723,6 +753,7 @@ function App() {
     }
 
     setIsEditorOpen(false);
+    setReworkMode(false);
   }
 
   function deleteCard(cardId: string) {
@@ -784,6 +815,60 @@ function App() {
     if (socketStatus === "closed") {
       connect();
     }
+  }
+
+  // Retrigger a task stuck in "queued" (handed to the publisher but no result
+  // ever came back). We abandon the prior attempt, give the re-run a fresh task
+  // id so it has its own stream identity, clear the stale result, and re-enqueue.
+  function retryCard(cardId: string) {
+    const card = cards.find((item) => item.id === cardId);
+    if (!card || card.publishStatus !== "queued") {
+      return;
+    }
+
+    const isReview = card.column === "review";
+
+    // Drop any local queue/pending state for this card so the fresh enqueue
+    // isn't deduped, and so a late ack for the abandoned send is ignored.
+    if (pendingCardRef.current === cardId) {
+      clearPendingPublish();
+    }
+    queueRef.current = queueRef.current.filter((item) => item.cardId !== cardId);
+    setPublishQueue(queueRef.current);
+
+    setCards((current) =>
+      current.map((item) =>
+        item.id === cardId
+          ? {
+              ...item,
+              publishStatus: "draft",
+              ...(isReview
+                ? {
+                    reviewTaskId: undefined,
+                    reviewStreamId: undefined,
+                    reviewError: undefined,
+                    reviewRequestedAt: undefined,
+                    reviewCompletedAt: undefined
+                  }
+                : { taskId: crypto.randomUUID() }),
+              streamId: undefined,
+              error: undefined,
+              resultMessage: undefined,
+              resultStreamId: undefined,
+              completedAt: undefined,
+              questions: undefined,
+              updatedAt: Date.now()
+            }
+          : item
+      )
+    );
+
+    enqueueCards([cardId], isReview ? "review" : "work", isReview ? card.completedBy : undefined);
+
+    if (socketStatus === "closed") {
+      connect();
+    }
+    setLastEvent(`Retrying ${card.title}`);
   }
 
   function publishColumn(column: ColumnId) {
@@ -992,6 +1077,8 @@ function App() {
                     onEdit={() => openEditCard(card)}
                     onDelete={() => deleteCard(card.id)}
                     onPublish={() => publishCard(card.id)}
+                    onRework={() => openReworkCard(card)}
+                    onRetry={() => retryCard(card.id)}
                     onDragStart={() => setDraggedId(card.id)}
                     onDragEnd={() => setDraggedId(null)}
                   />
@@ -1036,14 +1123,35 @@ function App() {
                 <p>{selectedCard.column.replace("_", " ")}</p>
                 <h2>{selectedCard.title}</h2>
               </div>
-              <button
-                className="primary-button"
-                onClick={() => publishCard(selectedCard.id)}
-                disabled={isPublishing(selectedCard)}
-              >
-                <Send size={18} />
-                Publish
-              </button>
+              <div className="detail-heading-actions">
+                {selectedCard.publishStatus === "queued" ? (
+                  <button
+                    className="secondary-button"
+                    onClick={() => retryCard(selectedCard.id)}
+                    title="Retry: abandon the stuck attempt and re-publish with a new Task ID"
+                  >
+                    <RotateCcw size={18} />
+                    Retry
+                  </button>
+                ) : null}
+                {isDoneCard(selectedCard) ? (
+                  <button
+                    className="secondary-button"
+                    onClick={() => openReworkCard(selectedCard)}
+                  >
+                    <RefreshCw size={18} />
+                    Rework
+                  </button>
+                ) : null}
+                <button
+                  className="primary-button"
+                  onClick={() => publishCard(selectedCard.id)}
+                  disabled={isPublishing(selectedCard)}
+                >
+                  <Send size={18} />
+                  Publish
+                </button>
+              </div>
             </div>
             <div className="detail-grid">
               <Field label="Model" value={selectedCard.model} />
@@ -1124,16 +1232,26 @@ function App() {
         <div className="modal-backdrop" role="presentation">
           <form className="editor" onSubmit={saveDraft}>
             <header>
-              <h2>{selectedId ? "Edit Card" : "New Card"}</h2>
+              <h2>{reworkMode ? "Rework Task" : selectedId ? "Edit Task" : "New Task"}</h2>
               <button
                 type="button"
                 className="icon-button"
-                onClick={() => setIsEditorOpen(false)}
+                onClick={() => {
+                  setIsEditorOpen(false);
+                  setReworkMode(false);
+                }}
                 aria-label="Close editor"
               >
                 <X size={18} />
               </button>
             </header>
+
+            {reworkMode ? (
+              <p className="editor-hint">
+                Fix the prompt below. Saving moves this task back to Backlog as a
+                fresh draft (new Task ID); publish it again when you're ready to re-run.
+              </p>
+            ) : null}
 
             <label>
               <span>Title</span>
@@ -1365,6 +1483,8 @@ function KanbanCardView({
   onEdit,
   onDelete,
   onPublish,
+  onRework,
+  onRetry,
   onDragStart,
   onDragEnd
 }: {
@@ -1375,6 +1495,8 @@ function KanbanCardView({
   onEdit: () => void;
   onDelete: () => void;
   onPublish: () => void;
+  onRework: () => void;
+  onRetry: () => void;
   onDragStart: () => void;
   onDragEnd: () => void;
 }) {
@@ -1400,6 +1522,32 @@ function KanbanCardView({
       <footer>
         <span>{card.assignee || "Unassigned"}</span>
         <div className="card-actions">
+          {card.publishStatus === "queued" ? (
+            <button
+              className="icon-button"
+              onClick={(event) => {
+                event.stopPropagation();
+                onRetry();
+              }}
+              aria-label={`Retry ${card.title}`}
+              title="Retry: abandon the stuck attempt and re-publish with a new Task ID"
+            >
+              <RotateCcw size={16} />
+            </button>
+          ) : null}
+          {isDoneCard(card) ? (
+            <button
+              className="icon-button"
+              onClick={(event) => {
+                event.stopPropagation();
+                onRework();
+              }}
+              aria-label={`Rework ${card.title}`}
+              title="Rework: edit the prompt and send back to Backlog"
+            >
+              <RefreshCw size={16} />
+            </button>
+          ) : null}
           <button
             className="icon-button"
             disabled={publishing}
