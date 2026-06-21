@@ -836,6 +836,7 @@ dependencies = [
  "dotenvy",
  "futures-util",
  "redis",
+ "reqwest",
  "ring",
  "serde",
  "serde_json",

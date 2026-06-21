@@ -201,6 +201,9 @@ Environment variables:
 - `PUBLISHER_UPDATE_BUFFER`: websocket broadcast buffer for task updates. Default: `256`
 - `GYNE_AGENT_SESSION_SECRET`: enables 2ndBrain launch-token verification when set. Use at least 32 random bytes.
 - `GYNE_AGENT_TOOL_ID`: expected launch-token tool id. Default: `gyne-agent`
+- `MARKETPLACE_LAUNCH_VERIFY_URL`: optional 2ndBrain server endpoint for revoking active launches after logout, usually `https://your-2ndbrain-domain/api/marketplace/launch-session/verify`
+- `MARKETPLACE_LAUNCH_VERIFY_SECRET`: required when `MARKETPLACE_LAUNCH_VERIFY_URL` is set. Must match 2ndBrain and be at least 32 bytes.
+- `MARKETPLACE_LAUNCH_VERIFY_INTERVAL_SECONDS`: websocket liveness check interval. Default: `15`
 - `OPENCLAW_BASE_URL`: used to build `/chat/completions` when `OPENCLAW_CHAT_COMPLETIONS_URL` is unset
 - `OPENCLAW_CHAT_COMPLETIONS_URL`: full chat completions URL
 - `OPENCLAW_GATEWAY_TOKEN`: required by the consumer
@@ -231,6 +234,8 @@ Single public service:
 GYNE_AGENT_SERVICE=publisher
 REDIS_URL=redis://...
 GYNE_AGENT_SESSION_SECRET=long-random-secret
+MARKETPLACE_LAUNCH_VERIFY_URL=https://2ndbrain.example.com/api/marketplace/launch-session/verify
+MARKETPLACE_LAUNCH_VERIFY_SECRET=long-random-secret-shared-with-2ndbrain
 DEFAULT_MODEL=openclaw
 ```
 

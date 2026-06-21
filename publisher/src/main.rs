@@ -15,9 +15,12 @@ use redis::streams::StreamReadReply;
 use ring::hmac;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
-use std::{collections::HashMap, env, net::SocketAddr, path::PathBuf, sync::Arc};
+use std::{collections::HashMap, env, net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 use task_core::{now_millis, ConsumerDiscovery, PublisherResponse, TaskRequest, TaskUpdate};
-use tokio::sync::broadcast;
+use tokio::{
+    sync::broadcast,
+    time::{interval, MissedTickBehavior},
+};
 use tower_http::{
     services::{ServeDir, ServeFile},
     trace::TraceLayer,
@@ -34,6 +37,7 @@ struct AppState {
     consumer_stale_after_ms: u64,
     result_block_ms: usize,
     launch_auth: LaunchAuthConfig,
+    launch_verify_client: reqwest::Client,
     updates: broadcast::Sender<TaskUpdateEnvelope>,
 }
 
@@ -41,12 +45,16 @@ struct AppState {
 struct LaunchAuthConfig {
     secret: Option<String>,
     tool_id: String,
+    verify_interval: Duration,
+    verify_secret: Option<String>,
+    verify_url: Option<String>,
 }
 
 #[derive(Clone, Debug)]
 struct LaunchSession {
     email: Option<String>,
     install_id: Option<String>,
+    issued_at: usize,
     tool_id: String,
     user_id: String,
 }
@@ -65,8 +73,25 @@ struct LaunchTokenClaims {
     exp: usize,
     #[serde(default)]
     install_id: Option<String>,
+    iat: usize,
     tool_id: String,
     user_id: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LaunchSessionVerifyRequest<'a> {
+    install_id: &'a str,
+    issued_at: usize,
+    tool_id: &'a str,
+    user_id: &'a str,
+}
+
+#[derive(Deserialize)]
+struct LaunchSessionVerifyResponse {
+    active: bool,
+    #[serde(default)]
+    error: Option<String>,
 }
 
 #[tokio::main]
@@ -99,6 +124,7 @@ async fn main() -> Result<()> {
         consumer_stale_after_ms,
         result_block_ms,
         launch_auth,
+        launch_verify_client: reqwest::Client::new(),
         updates,
     });
     spawn_result_listener(state.clone());
@@ -144,6 +170,7 @@ async fn health(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
         "consumer_registry_key": state.consumer_registry_key,
         "has_default_model": state.default_model.is_some(),
         "launch_auth_required": state.launch_auth.is_required(),
+        "launch_liveness_required": state.launch_auth.has_session_verifier(),
     }))
 }
 
@@ -151,11 +178,23 @@ async fn consumers(
     Query(params): Query<HashMap<String, String>>,
     State(state): State<Arc<AppState>>,
 ) -> axum::response::Response {
-    if let Err(err) = launch_session_from_query(&state.launch_auth, &params) {
-        warn!(error = %err, "consumer discovery auth failed");
+    let session = match launch_session_from_query(&state.launch_auth, &params) {
+        Ok(session) => session,
+        Err(err) => {
+            warn!(error = %err, "consumer discovery auth failed");
+            return (
+                StatusCode::UNAUTHORIZED,
+                "valid 2ndBrain launch token is required",
+            )
+                .into_response();
+        }
+    };
+
+    if let Err(err) = verify_launch_session_active(&state, session.as_ref()).await {
+        warn!(error = %err, "consumer discovery launch session inactive");
         return (
             StatusCode::UNAUTHORIZED,
-            "valid 2ndBrain launch token is required",
+            "2ndBrain launch session is no longer active",
         )
             .into_response();
     }
@@ -181,9 +220,19 @@ async fn ws_handler(
     State(state): State<Arc<AppState>>,
 ) -> axum::response::Response {
     match launch_session_from_query(&state.launch_auth, &params) {
-        Ok(session) => ws
-            .on_upgrade(move |socket| handle_socket(socket, state, session))
-            .into_response(),
+        Ok(session) => {
+            if let Err(err) = verify_launch_session_active(&state, session.as_ref()).await {
+                warn!(error = %err, "websocket launch session inactive");
+                return (
+                    StatusCode::UNAUTHORIZED,
+                    "2ndBrain launch session is no longer active",
+                )
+                    .into_response();
+            }
+
+            ws.on_upgrade(move |socket| handle_socket(socket, state, session))
+                .into_response()
+        }
         Err(err) => {
             warn!(error = %err, "websocket launch auth failed");
             (
@@ -212,9 +261,25 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, session: Option<
         }
     };
     let mut updates = state.updates.subscribe();
+    let mut session_check = interval(state.launch_auth.verify_interval);
+    session_check.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
     loop {
         tokio::select! {
+            _ = session_check.tick(), if session.is_some() && state.launch_auth.has_session_verifier() => {
+                if let Err(err) = verify_launch_session_active(&state, session.as_ref()).await {
+                    warn!(error = %err, "closing inactive 2ndBrain launch session");
+                    let _ = send_json(
+                        &mut sender,
+                        &PublisherResponse::Error {
+                            message: "2ndBrain session has been logged out. Launch this tool from 2ndBrain again.".to_owned(),
+                        },
+                    )
+                    .await;
+                    let _ = sender.send(Message::Close(None)).await;
+                    return;
+                }
+            }
             message = receiver.next() => {
                 let Some(message) = message else {
                     return;
@@ -295,6 +360,8 @@ async fn handle_client_payload_inner(
     redis: &mut redis::aio::MultiplexedConnection,
     session: Option<&LaunchSession>,
 ) -> Result<PublisherResponse> {
+    verify_launch_session_active(state, session).await?;
+
     let value: Value = serde_json::from_slice(payload).context("invalid publisher JSON")?;
     if value
         .get("type")
@@ -347,6 +414,11 @@ async fn handle_client_payload_inner(
 impl LaunchAuthConfig {
     fn from_env(bind: SocketAddr) -> Result<Self> {
         let secret = optional_env("GYNE_AGENT_SESSION_SECRET");
+        let verify_url = optional_env("MARKETPLACE_LAUNCH_VERIFY_URL");
+        let verify_secret = optional_env("MARKETPLACE_LAUNCH_VERIFY_SECRET");
+        let verify_interval_seconds: u64 =
+            parse_env("MARKETPLACE_LAUNCH_VERIFY_INTERVAL_SECONDS", 15)?;
+
         if let Some(secret) = secret.as_deref() {
             if secret.as_bytes().len() < 32 {
                 anyhow::bail!("GYNE_AGENT_SESSION_SECRET must be at least 32 bytes");
@@ -358,14 +430,45 @@ impl LaunchAuthConfig {
             );
         }
 
+        if verify_url.is_some() && secret.is_none() {
+            anyhow::bail!(
+                "GYNE_AGENT_SESSION_SECRET is required when MARKETPLACE_LAUNCH_VERIFY_URL is set"
+            );
+        }
+        if verify_url.is_some() && verify_secret.is_none() {
+            anyhow::bail!(
+                "MARKETPLACE_LAUNCH_VERIFY_SECRET is required when MARKETPLACE_LAUNCH_VERIFY_URL is set"
+            );
+        }
+        if let Some(secret) = verify_secret.as_deref() {
+            if secret.as_bytes().len() < 32 {
+                anyhow::bail!("MARKETPLACE_LAUNCH_VERIFY_SECRET must be at least 32 bytes");
+            }
+        }
+        if let Some(url) = verify_url.as_deref() {
+            reqwest::Url::parse(url)
+                .context("MARKETPLACE_LAUNCH_VERIFY_URL must be a valid URL")?;
+        } else if verify_secret.is_some() {
+            warn!(
+                "MARKETPLACE_LAUNCH_VERIFY_SECRET is set but MARKETPLACE_LAUNCH_VERIFY_URL is missing; logout revocation checks are disabled"
+            );
+        }
+
         Ok(Self {
             secret,
             tool_id: env_or("GYNE_AGENT_TOOL_ID", "gyne-agent"),
+            verify_interval: Duration::from_secs(verify_interval_seconds.clamp(5, 300)),
+            verify_secret,
+            verify_url,
         })
     }
 
     fn is_required(&self) -> bool {
         self.secret.is_some()
+    }
+
+    fn has_session_verifier(&self) -> bool {
+        self.verify_url.is_some() && self.verify_secret.is_some()
     }
 }
 
@@ -425,6 +528,9 @@ fn verify_launch_token(
     if claims.exp.saturating_add(30) < now_seconds {
         anyhow::bail!("launch token has expired");
     }
+    if claims.iat > now_seconds.saturating_add(30) {
+        anyhow::bail!("launch token was issued in the future");
+    }
 
     let user_id = claims.user_id.trim();
     let tool_id = claims.tool_id.trim();
@@ -445,9 +551,60 @@ fn verify_launch_token(
             .install_id
             .map(|install_id| install_id.trim().to_owned())
             .filter(|install_id| !install_id.is_empty()),
+        issued_at: claims.iat,
         tool_id: tool_id.to_owned(),
         user_id: user_id.to_owned(),
     })
+}
+
+async fn verify_launch_session_active(
+    state: &AppState,
+    session: Option<&LaunchSession>,
+) -> Result<()> {
+    let Some(verify_url) = state.launch_auth.verify_url.as_deref() else {
+        return Ok(());
+    };
+    let verify_secret = state
+        .launch_auth
+        .verify_secret
+        .as_deref()
+        .context("MARKETPLACE_LAUNCH_VERIFY_SECRET is required")?;
+    let session = session.context("launch session is required")?;
+    let install_id = session
+        .install_id
+        .as_deref()
+        .context("launch session is missing install_id")?;
+    let response = state
+        .launch_verify_client
+        .post(verify_url)
+        .bearer_auth(verify_secret)
+        .json(&LaunchSessionVerifyRequest {
+            install_id,
+            issued_at: session.issued_at,
+            tool_id: &session.tool_id,
+            user_id: &session.user_id,
+        })
+        .send()
+        .await
+        .context("failed to verify 2ndBrain launch session")?;
+    let status = response.status();
+    let body = response
+        .text()
+        .await
+        .context("failed to read 2ndBrain launch verification response")?;
+    let parsed = serde_json::from_str::<LaunchSessionVerifyResponse>(&body).ok();
+    let active = parsed.as_ref().is_some_and(|payload| payload.active);
+
+    if !status.is_success() || !active {
+        let message = parsed
+            .and_then(|payload| payload.error)
+            .filter(|message| !message.trim().is_empty())
+            .unwrap_or_else(|| format!("2ndBrain launch verification failed with {status}"));
+
+        anyhow::bail!("{message}");
+    }
+
+    Ok(())
 }
 
 fn apply_launch_metadata(task: &mut task_core::ChatTask, session: &LaunchSession) {
