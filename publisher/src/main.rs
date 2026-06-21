@@ -5,7 +5,7 @@ use axum::{
         ws::{Message, WebSocket, WebSocketUpgrade},
         Query, State,
     },
-    http::{header, HeaderMap, StatusCode, Uri},
+    http::{header, HeaderMap, HeaderValue, StatusCode, Uri},
     response::IntoResponse,
     routing::get,
     Json, Router,
@@ -154,6 +154,7 @@ async fn main() -> Result<()> {
     let app = Router::new()
         .route("/health", get(health))
         .route("/consumers", get(consumers))
+        .route("/api/session", get(session_status))
         .route("/ws", get(ws_handler))
         .fallback(frontend_handler)
         .layer(TraceLayer::new_for_http())
@@ -275,6 +276,79 @@ async fn consumers(
     };
 
     Json(response).into_response()
+}
+
+async fn session_status(
+    Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+    State(state): State<Arc<AppState>>,
+) -> axum::response::Response {
+    if !state.launch_auth.is_required() {
+        return json_status_response(
+            &state.launch_auth,
+            StatusCode::OK,
+            json!({
+                "authenticated": false,
+                "launchAuthRequired": false,
+            }),
+            false,
+        );
+    }
+
+    let session = match launch_session_from_request(&state.launch_auth, &params, &headers) {
+        Ok(Some(session)) => session,
+        Ok(None) => {
+            return json_status_response(
+                &state.launch_auth,
+                StatusCode::UNAUTHORIZED,
+                json!({
+                    "authenticated": false,
+                    "error": "Launch this tool from 2ndBrain to continue.",
+                    "launchAuthRequired": true,
+                }),
+                true,
+            );
+        }
+        Err(err) => {
+            return json_status_response(
+                &state.launch_auth,
+                StatusCode::UNAUTHORIZED,
+                json!({
+                    "authenticated": false,
+                    "error": err.to_string(),
+                    "launchAuthRequired": true,
+                }),
+                true,
+            );
+        }
+    };
+
+    if let Err(err) = verify_launch_session_active(&state, Some(&session)).await {
+        return json_status_response(
+            &state.launch_auth,
+            StatusCode::UNAUTHORIZED,
+            json!({
+                "authenticated": false,
+                "error": err.to_string(),
+                "launchAuthRequired": true,
+            }),
+            true,
+        );
+    }
+
+    json_status_response(
+        &state.launch_auth,
+        StatusCode::OK,
+        json!({
+            "authenticated": true,
+            "email": session.email,
+            "exp": session.expires_at,
+            "installId": session.install_id,
+            "toolId": session.tool_id,
+            "userId": session.user_id,
+        }),
+        false,
+    )
 }
 
 async fn ws_handler(
@@ -1326,6 +1400,26 @@ fn launch_required_response(
         Body::from(launch_required_page(message)),
         clear_cookie.then(|| clear_session_cookie_header(auth)),
     )
+}
+
+fn json_status_response(
+    auth: &LaunchAuthConfig,
+    status: StatusCode,
+    payload: Value,
+    clear_cookie: bool,
+) -> axum::response::Response {
+    let mut response = (status, Json(payload)).into_response();
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+
+    if clear_cookie {
+        if let Ok(value) = HeaderValue::from_str(&clear_session_cookie_header(auth)) {
+            response.headers_mut().insert(header::SET_COOKIE, value);
+        }
+    }
+
+    response
 }
 
 fn launch_required_page(message: &str) -> String {

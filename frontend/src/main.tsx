@@ -154,6 +154,7 @@ const priorityLabels: Record<Priority, string> = {
 const defaultModel = import.meta.env.VITE_DEFAULT_MODEL ?? "openclaw";
 const launchToken = readLaunchToken();
 const defaultWsUrl = launchPublisherWsUrl();
+const authCheckIntervalMs = 15000;
 const storageKey = "gyne-agent-kanban";
 const singaporeTimeZone = "Asia/Singapore";
 const singaporeTimeZoneLabel = "SGT";
@@ -265,6 +266,18 @@ function websocketUrlWithLaunchToken(url: string) {
   }
 }
 
+function LaunchExpired({ message }: { message: string }) {
+  return (
+    <main className="launch-expired">
+      <section className="launch-expired-panel">
+        <p>2ndBrain launch auth</p>
+        <h1>Launch required</h1>
+        <span>{message || "This Gyne Agent session is no longer active. Launch it again from 2ndBrain."}</span>
+      </section>
+    </main>
+  );
+}
+
 function App() {
   const [cards, setCards] = React.useState<KanbanCard[]>(loadCards);
   const [selectedId, setSelectedId] = React.useState<string | null>(
@@ -282,6 +295,8 @@ function App() {
   const [consumers, setConsumers] = React.useState<ConsumerDiscovery[]>([]);
   const [lastDiscoveryAt, setLastDiscoveryAt] = React.useState<number | null>(null);
   const [lastEvent, setLastEvent] = React.useState("Disconnected");
+  const [authExpired, setAuthExpired] = React.useState(false);
+  const [authExpiredMessage, setAuthExpiredMessage] = React.useState("");
   const socketRef = React.useRef<WebSocket | null>(null);
   const pendingCardRef = React.useRef<string | null>(null);
   const pendingKindRef = React.useRef<PublishKind>("work");
@@ -307,6 +322,51 @@ function App() {
   React.useEffect(() => {
     return () => {
       socketRef.current?.close();
+    };
+  }, []);
+
+  React.useEffect(() => {
+    let ignore = false;
+
+    async function checkSession() {
+      try {
+        const response = await fetch("/api/session", { cache: "no-store" });
+
+        if (response.status !== 401) {
+          return;
+        }
+
+        let payload: { error?: string } | null = null;
+
+        try {
+          payload = await response.json();
+        } catch {
+          payload = null;
+        }
+
+        if (!ignore) {
+          socketRef.current?.close();
+          socketRef.current = null;
+          setSocketStatus("closed");
+          setConsumers([]);
+          setLastEvent("Launch required");
+          setAuthExpired(true);
+          setAuthExpiredMessage(
+            payload?.error ||
+              "This Gyne Agent session is no longer active. Launch it again from 2ndBrain."
+          );
+        }
+      } catch {
+        // Local Vite development does not expose the production auth endpoint.
+      }
+    }
+
+    checkSession();
+    const timer = window.setInterval(checkSession, authCheckIntervalMs);
+
+    return () => {
+      ignore = true;
+      window.clearInterval(timer);
     };
   }, []);
 
@@ -1044,6 +1104,10 @@ function App() {
       moveCard(draggedId, column);
       setDraggedId(null);
     }
+  }
+
+  if (authExpired) {
+    return <LaunchExpired message={authExpiredMessage} />;
   }
 
   return (

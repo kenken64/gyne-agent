@@ -30,6 +30,45 @@ button {
   cursor: pointer;
 }
 
+.launch-expired {
+  align-items: center;
+  background: #eef5f4;
+  display: grid;
+  min-height: 100vh;
+  padding: 24px;
+}
+
+.launch-expired-panel {
+  background: #ffffff;
+  border: 1px solid #d8e2df;
+  border-radius: 10px;
+  box-shadow: 0 24px 60px rgba(15, 23, 42, 0.14);
+  margin: 0 auto;
+  max-width: 460px;
+  padding: 28px;
+}
+
+.launch-expired-panel h1 {
+  color: #172033;
+  font-size: 30px;
+  margin: 8px 0 12px;
+}
+
+.launch-expired-panel p {
+  color: #087c70;
+  font-size: 13px;
+  font-weight: 800;
+  letter-spacing: 0.08em;
+  margin: 0;
+  text-transform: uppercase;
+}
+
+.launch-expired-panel span {
+  color: #667085;
+  display: block;
+  line-height: 1.55;
+}
+
 .app-shell {
   display: grid;
   grid-template-rows: auto minmax(0, 1fr);
