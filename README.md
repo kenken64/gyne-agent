@@ -86,6 +86,8 @@ For single-service deployments, the publisher can also serve the built frontend 
 https://gyne-agent.example.com/?token=...&publisher_ws_url=wss://gyne-agent.example.com/ws
 ```
 
+When `GYNE_AGENT_SESSION_SECRET` is set, the bundled frontend is protected too. The first request must include a launch token; the publisher stores a signed HTTP-only launch cookie and denies direct `/` or `/assets/...` access without that cookie. If `MARKETPLACE_LAUNCH_VERIFY_URL` is configured, the cookie is also checked against 2ndBrain logout revocation before every frontend response.
+
 ## Frontend Websocket Payload
 
 Send a JSON message like this to the publisher websocket:
@@ -200,6 +202,7 @@ Environment variables:
 - `RESULT_STREAM_BLOCK_MS`: publisher block timeout when watching results. Default: `5000`
 - `PUBLISHER_UPDATE_BUFFER`: websocket broadcast buffer for task updates. Default: `256`
 - `GYNE_AGENT_SESSION_SECRET`: enables 2ndBrain launch-token verification when set. Use at least 32 random bytes.
+- `GYNE_AGENT_SESSION_COOKIE`: signed launch cookie name for the bundled frontend. Default: `gyne_agent_session`
 - `GYNE_AGENT_TOOL_ID`: expected launch-token tool id. Default: `gyne-agent`
 - `MARKETPLACE_LAUNCH_VERIFY_URL`: optional 2ndBrain server endpoint for revoking active launches after logout, usually `https://your-2ndbrain-domain/api/marketplace/launch-session/verify`
 - `MARKETPLACE_LAUNCH_VERIFY_SECRET`: required when `MARKETPLACE_LAUNCH_VERIFY_URL` is set. Must match 2ndBrain and be at least 32 bytes.

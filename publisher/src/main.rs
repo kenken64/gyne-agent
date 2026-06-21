@@ -1,10 +1,11 @@
 use anyhow::{Context, Result};
 use axum::{
+    body::Body,
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},
         Query, State,
     },
-    http::StatusCode,
+    http::{header, HeaderMap, StatusCode, Uri},
     response::IntoResponse,
     routing::get,
     Json, Router,
@@ -15,16 +16,20 @@ use redis::streams::StreamReadReply;
 use ring::hmac;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
-use std::{collections::HashMap, env, net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    env,
+    net::SocketAddr,
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::Duration,
+};
 use task_core::{now_millis, ConsumerDiscovery, PublisherResponse, TaskRequest, TaskUpdate};
 use tokio::{
     sync::broadcast,
     time::{interval, MissedTickBehavior},
 };
-use tower_http::{
-    services::{ServeDir, ServeFile},
-    trace::TraceLayer,
-};
+use tower_http::trace::TraceLayer;
 use tracing::{error, info, warn};
 
 #[derive(Clone)]
@@ -36,6 +41,7 @@ struct AppState {
     consumer_registry_key: String,
     consumer_stale_after_ms: u64,
     result_block_ms: usize,
+    frontend_dist_dir: PathBuf,
     launch_auth: LaunchAuthConfig,
     launch_verify_client: reqwest::Client,
     updates: broadcast::Sender<TaskUpdateEnvelope>,
@@ -44,15 +50,17 @@ struct AppState {
 #[derive(Clone)]
 struct LaunchAuthConfig {
     secret: Option<String>,
+    session_cookie_name: String,
     tool_id: String,
     verify_interval: Duration,
     verify_secret: Option<String>,
     verify_url: Option<String>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 struct LaunchSession {
     email: Option<String>,
+    expires_at: usize,
     install_id: Option<String>,
     issued_at: usize,
     tool_id: String,
@@ -123,6 +131,7 @@ async fn main() -> Result<()> {
         consumer_registry_key,
         consumer_stale_after_ms,
         result_block_ms,
+        frontend_dist_dir: frontend_dist_dir.clone(),
         launch_auth,
         launch_verify_client: reqwest::Client::new(),
         updates,
@@ -146,9 +155,7 @@ async fn main() -> Result<()> {
         .route("/health", get(health))
         .route("/consumers", get(consumers))
         .route("/ws", get(ws_handler))
-        .fallback_service(
-            ServeDir::new(&frontend_dist_dir).not_found_service(ServeFile::new(frontend_index)),
-        )
+        .fallback(frontend_handler)
         .layer(TraceLayer::new_for_http())
         .with_state(state);
 
@@ -171,14 +178,70 @@ async fn health(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
         "has_default_model": state.default_model.is_some(),
         "launch_auth_required": state.launch_auth.is_required(),
         "launch_liveness_required": state.launch_auth.has_session_verifier(),
+        "frontend_auth_required": state.launch_auth.is_required(),
     }))
+}
+
+async fn frontend_handler(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+    uri: Uri,
+) -> axum::response::Response {
+    let set_cookie = match verify_frontend_launch_session(&state, &params, &headers).await {
+        Ok(set_cookie) => set_cookie,
+        Err(err) => {
+            warn!(path = %uri.path(), error = %err, "frontend launch auth failed");
+            return launch_required_response(
+                &state.launch_auth,
+                StatusCode::UNAUTHORIZED,
+                "Launch this tool from 2ndBrain to continue.",
+                true,
+            );
+        }
+    };
+
+    let path = match frontend_static_path(&state.frontend_dist_dir, uri.path()).await {
+        Ok(path) => path,
+        Err(err) => {
+            warn!(path = %uri.path(), error = %err, "frontend static path failed");
+            return launch_required_response(
+                &state.launch_auth,
+                StatusCode::NOT_FOUND,
+                "Requested frontend asset was not found.",
+                false,
+            );
+        }
+    };
+
+    let body = match tokio::fs::read(&path).await {
+        Ok(body) => body,
+        Err(err) => {
+            warn!(path = %path.display(), error = %err, "failed to read frontend asset");
+            return launch_required_response(
+                &state.launch_auth,
+                StatusCode::NOT_FOUND,
+                "Requested frontend asset was not found.",
+                false,
+            );
+        }
+    };
+
+    static_response(
+        StatusCode::OK,
+        frontend_content_type(&path),
+        frontend_cache_control(&path),
+        Body::from(body),
+        set_cookie,
+    )
 }
 
 async fn consumers(
     Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
     State(state): State<Arc<AppState>>,
 ) -> axum::response::Response {
-    let session = match launch_session_from_query(&state.launch_auth, &params) {
+    let session = match launch_session_from_request(&state.launch_auth, &params, &headers) {
         Ok(session) => session,
         Err(err) => {
             warn!(error = %err, "consumer discovery auth failed");
@@ -216,10 +279,11 @@ async fn consumers(
 
 async fn ws_handler(
     Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
     ws: WebSocketUpgrade,
     State(state): State<Arc<AppState>>,
 ) -> axum::response::Response {
-    match launch_session_from_query(&state.launch_auth, &params) {
+    match launch_session_from_request(&state.launch_auth, &params, &headers) {
         Ok(session) => {
             if let Err(err) = verify_launch_session_active(&state, session.as_ref()).await {
                 warn!(error = %err, "websocket launch session inactive");
@@ -456,6 +520,7 @@ impl LaunchAuthConfig {
 
         Ok(Self {
             secret,
+            session_cookie_name: env_or("GYNE_AGENT_SESSION_COOKIE", "gyne_agent_session"),
             tool_id: env_or("GYNE_AGENT_TOOL_ID", "gyne-agent"),
             verify_interval: Duration::from_secs(verify_interval_seconds.clamp(5, 300)),
             verify_secret,
@@ -472,21 +537,34 @@ impl LaunchAuthConfig {
     }
 }
 
-fn launch_session_from_query(
+fn launch_session_from_request(
     auth: &LaunchAuthConfig,
     params: &HashMap<String, String>,
+    headers: &HeaderMap,
 ) -> Result<Option<LaunchSession>> {
     let Some(secret) = auth.secret.as_deref() else {
         return Ok(None);
     };
-    let token = params
+
+    if let Some(token) = launch_token_from_params(params) {
+        return verify_launch_token(auth, secret, token).map(Some);
+    }
+
+    if let Some(cookie) = launch_session_cookie(headers, &auth.session_cookie_name) {
+        return verify_launch_session_cookie(auth, secret, cookie).map(Some);
+    }
+
+    anyhow::bail!("launch token or active launch session cookie is required");
+}
+
+fn launch_token_from_params(params: &HashMap<String, String>) -> Option<&str> {
+    params
         .get("token")
         .or_else(|| params.get("launch_token"))
         .or_else(|| params.get("2ndbrain_launch_token"))
         .map(String::as_str)
-        .context("launch token is required")?;
-
-    verify_launch_token(auth, secret, token).map(Some)
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
 }
 
 fn verify_launch_token(
@@ -547,6 +625,7 @@ fn verify_launch_token(
             .email
             .map(|email| email.trim().to_owned())
             .filter(|email| !email.is_empty()),
+        expires_at: claims.exp,
         install_id: claims
             .install_id
             .map(|install_id| install_id.trim().to_owned())
@@ -555,6 +634,144 @@ fn verify_launch_token(
         tool_id: tool_id.to_owned(),
         user_id: user_id.to_owned(),
     })
+}
+
+fn verify_launch_session_cookie(
+    auth: &LaunchAuthConfig,
+    secret: &str,
+    cookie: &str,
+) -> Result<LaunchSession> {
+    let (payload_part, signature_part) = cookie
+        .split_once('.')
+        .context("launch session cookie is malformed")?;
+    if signature_part.contains('.') {
+        anyhow::bail!("launch session cookie has too many segments");
+    }
+
+    let signature = URL_SAFE_NO_PAD
+        .decode(signature_part)
+        .context("launch session cookie signature is not base64url")?;
+    let key = hmac::Key::new(hmac::HMAC_SHA256, secret.as_bytes());
+    hmac::verify(&key, payload_part.as_bytes(), &signature)
+        .map_err(|_| anyhow::anyhow!("invalid launch session cookie signature"))?;
+
+    let payload_bytes = URL_SAFE_NO_PAD
+        .decode(payload_part)
+        .context("launch session cookie payload is not base64url")?;
+    let session: LaunchSession = serde_json::from_slice(&payload_bytes)
+        .context("launch session cookie payload is invalid")?;
+    let now_seconds = (now_millis() / 1000) as usize;
+
+    if session.expires_at.saturating_add(30) < now_seconds {
+        anyhow::bail!("launch session cookie has expired");
+    }
+    if session.issued_at > now_seconds.saturating_add(30) {
+        anyhow::bail!("launch session cookie was issued in the future");
+    }
+    if session.user_id.trim().is_empty() {
+        anyhow::bail!("launch session cookie is missing user_id");
+    }
+    if session.tool_id != auth.tool_id {
+        anyhow::bail!("launch session cookie tool_id mismatch");
+    }
+
+    Ok(session)
+}
+
+fn sign_launch_session_cookie(secret: &str, session: &LaunchSession) -> Result<String> {
+    let payload = serde_json::to_vec(session).context("failed to serialize launch session")?;
+    let payload_part = URL_SAFE_NO_PAD.encode(payload);
+    let key = hmac::Key::new(hmac::HMAC_SHA256, secret.as_bytes());
+    let signature = hmac::sign(&key, payload_part.as_bytes());
+    let signature_part = URL_SAFE_NO_PAD.encode(signature.as_ref());
+
+    Ok(format!("{payload_part}.{signature_part}"))
+}
+
+fn launch_session_cookie<'a>(headers: &'a HeaderMap, cookie_name: &str) -> Option<&'a str> {
+    headers
+        .get(header::COOKIE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|cookies| {
+            cookies.split(';').find_map(|cookie| {
+                let (name, value) = cookie.trim().split_once('=')?;
+
+                if name == cookie_name && !value.trim().is_empty() {
+                    Some(value.trim())
+                } else {
+                    None
+                }
+            })
+        })
+}
+
+async fn verify_frontend_launch_session(
+    state: &AppState,
+    params: &HashMap<String, String>,
+    headers: &HeaderMap,
+) -> Result<Option<String>> {
+    let Some(secret) = state.launch_auth.secret.as_deref() else {
+        return Ok(None);
+    };
+
+    if let Some(token) = launch_token_from_params(params) {
+        let session = verify_launch_token(&state.launch_auth, secret, token)?;
+        verify_launch_session_active(state, Some(&session)).await?;
+        return Ok(Some(session_cookie_header(
+            &state.launch_auth,
+            headers,
+            secret,
+            &session,
+        )?));
+    }
+
+    let cookie = launch_session_cookie(headers, &state.launch_auth.session_cookie_name)
+        .context("launch token or active launch session cookie is required")?;
+    let session = verify_launch_session_cookie(&state.launch_auth, secret, cookie)?;
+    verify_launch_session_active(state, Some(&session)).await?;
+
+    Ok(None)
+}
+
+fn session_cookie_header(
+    auth: &LaunchAuthConfig,
+    headers: &HeaderMap,
+    secret: &str,
+    session: &LaunchSession,
+) -> Result<String> {
+    let now_seconds = (now_millis() / 1000) as usize;
+    let max_age = session.expires_at.saturating_sub(now_seconds).max(1);
+    let mut attributes = vec![
+        format!(
+            "{}={}",
+            auth.session_cookie_name,
+            sign_launch_session_cookie(secret, session)?
+        ),
+        "HttpOnly".to_owned(),
+        "Path=/".to_owned(),
+        "SameSite=Lax".to_owned(),
+        format!("Max-Age={max_age}"),
+    ];
+
+    if secure_request(headers) {
+        attributes.push("Secure".to_owned());
+    }
+
+    Ok(attributes.join("; "))
+}
+
+fn clear_session_cookie_header(auth: &LaunchAuthConfig) -> String {
+    format!(
+        "{}=; HttpOnly; Path=/; SameSite=Lax; Max-Age=0",
+        auth.session_cookie_name
+    )
+}
+
+fn secure_request(headers: &HeaderMap) -> bool {
+    headers
+        .get("x-forwarded-proto")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|proto| proto.eq_ignore_ascii_case("https"))
 }
 
 async fn verify_launch_session_active(
@@ -998,6 +1215,154 @@ async fn send_json<T: Serialize>(
         .send(Message::Text(text.into()))
         .await
         .context("failed to send websocket response")
+}
+
+async fn frontend_static_path(root: &Path, request_path: &str) -> Result<PathBuf> {
+    let candidate = frontend_candidate_path(root, request_path)?;
+
+    match tokio::fs::metadata(&candidate).await {
+        Ok(metadata) if metadata.is_file() => Ok(candidate),
+        _ => {
+            let index = root.join("index.html");
+            match tokio::fs::metadata(&index).await {
+                Ok(metadata) if metadata.is_file() => Ok(index),
+                _ => anyhow::bail!("frontend index.html was not found"),
+            }
+        }
+    }
+}
+
+fn frontend_candidate_path(root: &Path, request_path: &str) -> Result<PathBuf> {
+    let mut path = root.to_path_buf();
+    let relative = request_path.trim_start_matches('/');
+    let relative = if relative.is_empty() {
+        "index.html"
+    } else {
+        relative
+    };
+
+    for segment in relative.split('/') {
+        if segment.is_empty() || segment == "." {
+            continue;
+        }
+        if segment == ".." || segment.contains('\\') {
+            anyhow::bail!("frontend path is not allowed");
+        }
+
+        path.push(segment);
+    }
+
+    Ok(path)
+}
+
+fn frontend_content_type(path: &Path) -> &'static str {
+    match path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .unwrap_or_default()
+    {
+        "css" => "text/css; charset=utf-8",
+        "gif" => "image/gif",
+        "html" => "text/html; charset=utf-8",
+        "ico" => "image/x-icon",
+        "jpg" | "jpeg" => "image/jpeg",
+        "js" => "text/javascript; charset=utf-8",
+        "json" | "map" => "application/json; charset=utf-8",
+        "png" => "image/png",
+        "svg" => "image/svg+xml",
+        "txt" => "text/plain; charset=utf-8",
+        "webp" => "image/webp",
+        _ => "application/octet-stream",
+    }
+}
+
+fn frontend_cache_control(path: &Path) -> &'static str {
+    if path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension == "html")
+    {
+        "no-store"
+    } else {
+        "public, max-age=31536000, immutable"
+    }
+}
+
+fn static_response(
+    status: StatusCode,
+    content_type: &'static str,
+    cache_control: &'static str,
+    body: Body,
+    set_cookie: Option<String>,
+) -> axum::response::Response {
+    let mut builder = axum::response::Response::builder()
+        .status(status)
+        .header(header::CACHE_CONTROL, cache_control)
+        .header(header::CONTENT_TYPE, content_type);
+
+    if let Some(set_cookie) = set_cookie {
+        builder = builder.header(header::SET_COOKIE, set_cookie);
+    }
+
+    builder.body(body).unwrap_or_else(|_| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "failed to build response",
+        )
+            .into_response()
+    })
+}
+
+fn launch_required_response(
+    auth: &LaunchAuthConfig,
+    status: StatusCode,
+    message: &str,
+    clear_cookie: bool,
+) -> axum::response::Response {
+    static_response(
+        status,
+        "text/html; charset=utf-8",
+        "no-store",
+        Body::from(launch_required_page(message)),
+        clear_cookie.then(|| clear_session_cookie_header(auth)),
+    )
+}
+
+fn launch_required_page(message: &str) -> String {
+    format!(
+        r#"<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>2ndBrain launch required</title>
+    <style>
+      :root {{ color: #17202a; background: #eef5f4; font-family: Inter, ui-sans-serif, system-ui, sans-serif; }}
+      body {{ display: grid; min-height: 100vh; place-items: center; margin: 0; padding: 24px; }}
+      main {{ width: min(100%, 460px); border: 1px solid #d8e2df; border-radius: 10px; background: #fff; padding: 28px; box-shadow: 0 24px 60px rgba(15, 23, 42, 0.14); }}
+      p {{ color: #5f6c76; line-height: 1.55; }}
+      strong {{ color: #087c70; }}
+    </style>
+  </head>
+  <body>
+    <main>
+      <strong>2ndBrain launch auth</strong>
+      <h1>Launch required</h1>
+      <p>{}</p>
+    </main>
+  </body>
+</html>"#,
+        escape_html(message)
+    )
+}
+
+fn escape_html(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#39;")
 }
 
 fn env_or(key: &str, default: &str) -> String {
