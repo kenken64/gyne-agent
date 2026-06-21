@@ -27,6 +27,8 @@ TELEGRAM_CHAT_ID=your-chat-id
 
 The publisher listens on `ws://127.0.0.1:8080/ws` by default.
 
+For public deployments, set `GYNE_AGENT_SESSION_SECRET` on the publisher. When this secret is set, `/ws` and `/consumers` require a short-lived 2ndBrain launch token.
+
 The React Kanban board is in `frontend/`:
 
 ```sh
@@ -34,6 +36,49 @@ cd frontend
 npm install
 npm run dev
 ```
+
+## 2ndBrain Launch Auth
+
+The publisher supports 2ndBrain launch auth with an HS256 JWT passed as a websocket query parameter:
+
+```text
+wss://gyne-agent.example.com/ws?token=...
+```
+
+The same `GYNE_AGENT_SESSION_SECRET` must be used by 2ndBrain when signing the token and by the Gyne Agent publisher when verifying it.
+
+Expected JWT payload:
+
+```json
+{
+  "user_id": "supabase-user-id",
+  "install_id": "marketplace-install-id",
+  "tool_id": "gyne-agent",
+  "email": "user@example.com",
+  "exp": 1779400300
+}
+```
+
+Required claims:
+
+- `user_id`
+- `tool_id`, matching `GYNE_AGENT_TOOL_ID` or the default `gyne-agent`
+- `exp`, as Unix seconds
+
+Optional claims:
+
+- `install_id`
+- `email`
+
+When launch auth is enabled, the publisher overwrites task metadata fields for `user_id`, `install_id`, `tool_id`, `email`, and `auth_source`. Client-supplied values for those fields are not trusted. Task result broadcasts are filtered so a websocket only receives updates for the same launch user and install.
+
+The frontend accepts launch URLs like:
+
+```text
+https://gyne-agent-ui.example.com/?token=...&publisher_ws_url=wss://gyne-agent-publisher.example.com/ws
+```
+
+It reads `token`, `launch_token`, or `2ndbrain_launch_token`, removes the token from the browser address bar, and appends it to the websocket connection.
 
 ## Frontend Websocket Payload
 
@@ -49,10 +94,12 @@ Send a JSON message like this to the publisher websocket:
   "temperature": 0.2,
   "max_tokens": 300,
   "metadata": {
-    "user_id": "frontend-user-123"
+    "card_id": "frontend-card-id"
   }
 }
 ```
+
+When launch auth is enabled, the publisher derives `metadata.user_id` from the signed 2ndBrain token.
 
 Omit `assigned_consumer` to let Redis assign the task to any consumer in the shared consumer group.
 
@@ -145,6 +192,8 @@ Environment variables:
 - `CONSUMER_STALE_AFTER_MS`: publisher cutoff for stale consumers. Default: `15000`
 - `RESULT_STREAM_BLOCK_MS`: publisher block timeout when watching results. Default: `5000`
 - `PUBLISHER_UPDATE_BUFFER`: websocket broadcast buffer for task updates. Default: `256`
+- `GYNE_AGENT_SESSION_SECRET`: enables 2ndBrain launch-token verification when set. Use at least 32 random bytes.
+- `GYNE_AGENT_TOOL_ID`: expected launch-token tool id. Default: `gyne-agent`
 - `OPENCLAW_BASE_URL`: used to build `/chat/completions` when `OPENCLAW_CHAT_COMPLETIONS_URL` is unset
 - `OPENCLAW_CHAT_COMPLETIONS_URL`: full chat completions URL
 - `OPENCLAW_GATEWAY_TOKEN`: required by the consumer
@@ -155,3 +204,50 @@ Environment variables:
 - `TELEGRAM_CHAT_ID`: optional Telegram chat ID for sending completed responses
 - `VITE_PUBLISHER_WS_URL`: frontend websocket URL. Default: `ws://127.0.0.1:8080/ws`
 - `VITE_DEFAULT_MODEL`: frontend default model. Default: `openclaw`
+- `VITE_2NDBRAIN_LAUNCH_TOKEN`: optional development-only launch token fallback. Prefer query parameters for real launches.
+
+## Railway Docker Deployment
+
+This repo includes `railway.json`, `railpack.json`, and a Dockerfile. `railway.json` tells Railway to use the Dockerfile. `railpack.json` supplies a start command fallback if a service is still configured to use Railpack.
+
+The container can run one of three services from the same image. Set `GYNE_AGENT_SERVICE` per Railway service:
+
+```text
+publisher
+consumer
+frontend
+```
+
+Publisher service:
+
+```env
+GYNE_AGENT_SERVICE=publisher
+REDIS_URL=redis://...
+GYNE_AGENT_SESSION_SECRET=long-random-secret
+DEFAULT_MODEL=openclaw
+```
+
+The start script binds the publisher to `0.0.0.0:$PORT` on Railway when `PUBLISHER_BIND` is not set.
+
+Consumer service:
+
+```env
+GYNE_AGENT_SERVICE=consumer
+REDIS_URL=redis://...
+CONSUMER_NAME=consumer-1
+OPENCLAW_GATEWAY_TOKEN=...
+```
+
+Frontend service:
+
+```env
+GYNE_AGENT_SERVICE=frontend
+```
+
+For frontend builds, set `VITE_PUBLISHER_WS_URL` as a Docker build arg when you want a baked-in websocket URL. Otherwise, pass `publisher_ws_url` in the 2ndBrain launch URL.
+
+If Railway still shows "No start command detected" and "Detected Rust", check the service build settings:
+
+- Builder should be Dockerfile, or leave it unset so `railway.json` can select Dockerfile.
+- If using Railpack intentionally, set the start command to `sh ./scripts/start-container.sh`.
+- Set `GYNE_AGENT_SERVICE=publisher` for the publisher service and `GYNE_AGENT_SERVICE=consumer` for the worker service.

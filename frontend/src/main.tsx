@@ -152,11 +152,15 @@ const priorityLabels: Record<Priority, string> = {
 };
 
 const defaultModel = import.meta.env.VITE_DEFAULT_MODEL ?? "openclaw";
-const defaultWsUrl =
-  import.meta.env.VITE_PUBLISHER_WS_URL ?? "ws://127.0.0.1:8080/ws";
+const launchToken = readLaunchToken();
+const defaultWsUrl = launchPublisherWsUrl();
 const storageKey = "gyne-agent-kanban";
 const singaporeTimeZone = "Asia/Singapore";
 const singaporeTimeZoneLabel = "SGT";
+
+if (launchToken) {
+  stripLaunchTokenFromLocation();
+}
 
 const initialCards: KanbanCard[] = [
   {
@@ -200,6 +204,66 @@ const initialCards: KanbanCard[] = [
     updatedAt: Date.now()
   }
 ];
+
+function readLaunchToken() {
+  const params = new URLSearchParams(window.location.search);
+
+  return (
+    params.get("token")?.trim() ||
+    params.get("launch_token")?.trim() ||
+    params.get("2ndbrain_launch_token")?.trim() ||
+    import.meta.env.VITE_2NDBRAIN_LAUNCH_TOKEN?.trim() ||
+    ""
+  );
+}
+
+function launchPublisherWsUrl() {
+  const params = new URLSearchParams(window.location.search);
+
+  return (
+    params.get("publisher_ws_url")?.trim() ||
+    params.get("ws_url")?.trim() ||
+    import.meta.env.VITE_PUBLISHER_WS_URL?.trim() ||
+    "ws://127.0.0.1:8080/ws"
+  );
+}
+
+function stripLaunchTokenFromLocation() {
+  const url = new URL(window.location.href);
+  let changed = false;
+
+  ["token", "launch_token", "2ndbrain_launch_token"].forEach((name) => {
+    if (url.searchParams.has(name)) {
+      url.searchParams.delete(name);
+      changed = true;
+    }
+  });
+
+  if (changed) {
+    window.history.replaceState(
+      window.history.state,
+      "",
+      `${url.pathname}${url.search}${url.hash}`
+    );
+  }
+}
+
+function websocketUrlWithLaunchToken(url: string) {
+  if (!launchToken) {
+    return url;
+  }
+
+  try {
+    const parsed = new URL(url, window.location.href);
+
+    parsed.searchParams.set("token", launchToken);
+    return parsed.toString();
+  } catch {
+    const separator = url.includes("?") ? "&" : "?";
+
+    return `${url}${separator}token=${encodeURIComponent(launchToken)}`;
+  }
+}
 
 function App() {
   const [cards, setCards] = React.useState<KanbanCard[]>(loadCards);
@@ -263,7 +327,7 @@ function App() {
 
     setSocketStatus("connecting");
     setLastEvent("Connecting");
-    const socket = new WebSocket(wsUrl);
+    const socket = new WebSocket(websocketUrlWithLaunchToken(wsUrl));
     socketRef.current = socket;
 
     socket.onopen = () => {

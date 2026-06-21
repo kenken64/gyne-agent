@@ -2,16 +2,19 @@ use anyhow::{Context, Result};
 use axum::{
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},
-        State,
+        Query, State,
     },
+    http::StatusCode,
     response::IntoResponse,
     routing::get,
     Json, Router,
 };
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use futures_util::{stream::SplitSink, SinkExt, StreamExt};
 use redis::streams::StreamReadReply;
-use serde::Serialize;
-use serde_json::{json, Value};
+use ring::hmac;
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Map, Value};
 use std::{collections::HashMap, env, net::SocketAddr, sync::Arc};
 use task_core::{now_millis, ConsumerDiscovery, PublisherResponse, TaskRequest, TaskUpdate};
 use tokio::sync::broadcast;
@@ -27,7 +30,40 @@ struct AppState {
     consumer_registry_key: String,
     consumer_stale_after_ms: u64,
     result_block_ms: usize,
-    updates: broadcast::Sender<PublisherResponse>,
+    launch_auth: LaunchAuthConfig,
+    updates: broadcast::Sender<TaskUpdateEnvelope>,
+}
+
+#[derive(Clone)]
+struct LaunchAuthConfig {
+    secret: Option<String>,
+    tool_id: String,
+}
+
+#[derive(Clone, Debug)]
+struct LaunchSession {
+    email: Option<String>,
+    install_id: Option<String>,
+    tool_id: String,
+    user_id: String,
+}
+
+#[derive(Clone, Debug)]
+struct TaskUpdateEnvelope {
+    install_id: Option<String>,
+    update: TaskUpdate,
+    user_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct LaunchTokenClaims {
+    #[serde(default)]
+    email: Option<String>,
+    exp: usize,
+    #[serde(default)]
+    install_id: Option<String>,
+    tool_id: String,
+    user_id: String,
 }
 
 #[tokio::main]
@@ -46,6 +82,7 @@ async fn main() -> Result<()> {
     let consumer_stale_after_ms = parse_env("CONSUMER_STALE_AFTER_MS", 15_000)?;
     let result_block_ms = parse_env("RESULT_STREAM_BLOCK_MS", 5_000)?;
     let update_buffer = parse_env("PUBLISHER_UPDATE_BUFFER", 256)?;
+    let launch_auth = LaunchAuthConfig::from_env(bind)?;
     let (updates, _) = broadcast::channel(update_buffer);
 
     let state = Arc::new(AppState {
@@ -56,6 +93,7 @@ async fn main() -> Result<()> {
         consumer_registry_key,
         consumer_stale_after_ms,
         result_block_ms,
+        launch_auth,
         updates,
     });
     spawn_result_listener(state.clone());
@@ -84,10 +122,23 @@ async fn health(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
         "result_stream": state.result_stream,
         "consumer_registry_key": state.consumer_registry_key,
         "has_default_model": state.default_model.is_some(),
+        "launch_auth_required": state.launch_auth.is_required(),
     }))
 }
 
-async fn consumers(State(state): State<Arc<AppState>>) -> Json<PublisherResponse> {
+async fn consumers(
+    Query(params): Query<HashMap<String, String>>,
+    State(state): State<Arc<AppState>>,
+) -> axum::response::Response {
+    if let Err(err) = launch_session_from_query(&state.launch_auth, &params) {
+        warn!(error = %err, "consumer discovery auth failed");
+        return (
+            StatusCode::UNAUTHORIZED,
+            "valid 2ndBrain launch token is required",
+        )
+            .into_response();
+    }
+
     let response = match state.redis.get_multiplexed_async_connection().await {
         Ok(mut redis) => match list_consumers(&mut redis, &state).await {
             Ok(consumers) => PublisherResponse::Consumers { consumers },
@@ -100,14 +151,30 @@ async fn consumers(State(state): State<Arc<AppState>>) -> Json<PublisherResponse
         },
     };
 
-    Json(response)
+    Json(response).into_response()
 }
 
-async fn ws_handler(ws: WebSocketUpgrade, State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| handle_socket(socket, state))
+async fn ws_handler(
+    Query(params): Query<HashMap<String, String>>,
+    ws: WebSocketUpgrade,
+    State(state): State<Arc<AppState>>,
+) -> axum::response::Response {
+    match launch_session_from_query(&state.launch_auth, &params) {
+        Ok(session) => ws
+            .on_upgrade(move |socket| handle_socket(socket, state, session))
+            .into_response(),
+        Err(err) => {
+            warn!(error = %err, "websocket launch auth failed");
+            (
+                StatusCode::UNAUTHORIZED,
+                "valid 2ndBrain launch token is required",
+            )
+                .into_response()
+        }
+    }
 }
 
-async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
+async fn handle_socket(socket: WebSocket, state: Arc<AppState>, session: Option<LaunchSession>) {
     let (mut sender, mut receiver) = socket.split();
     let mut redis = match state.redis.get_multiplexed_async_connection().await {
         Ok(connection) => connection,
@@ -141,10 +208,10 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
 
                 let response = match message {
                     Message::Text(text) => {
-                        handle_client_payload(text.to_string().as_bytes(), &state, &mut redis).await
+                        handle_client_payload(text.to_string().as_bytes(), &state, &mut redis, session.as_ref()).await
                     }
                     Message::Binary(bytes) => {
-                        handle_client_payload(bytes.as_ref(), &state, &mut redis).await
+                        handle_client_payload(bytes.as_ref(), &state, &mut redis, session.as_ref()).await
                     }
                     Message::Ping(bytes) => {
                         if let Err(err) = sender.send(Message::Pong(bytes)).await {
@@ -165,7 +232,11 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
             update = updates.recv() => {
                 match update {
                     Ok(update) => {
-                        if let Err(err) = send_json(&mut sender, &update).await {
+                        if !task_update_visible_to_session(&update, session.as_ref(), state.launch_auth.is_required()) {
+                            continue;
+                        }
+                        let response = PublisherResponse::TaskUpdate(update.update);
+                        if let Err(err) = send_json(&mut sender, &response).await {
                             warn!(error = %err, "websocket update send failed");
                             return;
                         }
@@ -184,8 +255,9 @@ async fn handle_client_payload(
     payload: &[u8],
     state: &AppState,
     redis: &mut redis::aio::MultiplexedConnection,
+    session: Option<&LaunchSession>,
 ) -> PublisherResponse {
-    match handle_client_payload_inner(payload, state, redis).await {
+    match handle_client_payload_inner(payload, state, redis, session).await {
         Ok(response) => response,
         Err(err) => {
             warn!(error = %err, "publisher request failed");
@@ -200,6 +272,7 @@ async fn handle_client_payload_inner(
     payload: &[u8],
     state: &AppState,
     redis: &mut redis::aio::MultiplexedConnection,
+    session: Option<&LaunchSession>,
 ) -> Result<PublisherResponse> {
     let value: Value = serde_json::from_slice(payload).context("invalid publisher JSON")?;
     if value
@@ -227,9 +300,12 @@ async fn handle_client_payload_inner(
 
     let request: TaskRequest =
         serde_json::from_value(request_value).context("invalid task JSON")?;
-    let task = request
+    let mut task = request
         .into_task(state.default_model.as_deref())
         .context("invalid task payload")?;
+    if let Some(session) = session {
+        apply_launch_metadata(&mut task, session);
+    }
     validate_review_assignment(&task)?;
     let task_id = task.task_id.clone();
     let publish_stream = task_publish_stream(redis, state, &task).await?;
@@ -245,6 +321,170 @@ async fn handle_client_payload_inner(
         .context("failed to append task to Redis stream")?;
 
     Ok(PublisherResponse::Accepted { task_id, stream_id })
+}
+
+impl LaunchAuthConfig {
+    fn from_env(bind: SocketAddr) -> Result<Self> {
+        let secret = optional_env("GYNE_AGENT_SESSION_SECRET");
+        if let Some(secret) = secret.as_deref() {
+            if secret.as_bytes().len() < 32 {
+                anyhow::bail!("GYNE_AGENT_SESSION_SECRET must be at least 32 bytes");
+            }
+        } else if bind.ip().is_unspecified() {
+            warn!(
+                bind = %bind,
+                "GYNE_AGENT_SESSION_SECRET is not set while publisher is bound publicly; websocket launch auth is disabled"
+            );
+        }
+
+        Ok(Self {
+            secret,
+            tool_id: env_or("GYNE_AGENT_TOOL_ID", "gyne-agent"),
+        })
+    }
+
+    fn is_required(&self) -> bool {
+        self.secret.is_some()
+    }
+}
+
+fn launch_session_from_query(
+    auth: &LaunchAuthConfig,
+    params: &HashMap<String, String>,
+) -> Result<Option<LaunchSession>> {
+    let Some(secret) = auth.secret.as_deref() else {
+        return Ok(None);
+    };
+    let token = params
+        .get("token")
+        .or_else(|| params.get("launch_token"))
+        .or_else(|| params.get("2ndbrain_launch_token"))
+        .map(String::as_str)
+        .context("launch token is required")?;
+
+    verify_launch_token(auth, secret, token).map(Some)
+}
+
+fn verify_launch_token(
+    auth: &LaunchAuthConfig,
+    secret: &str,
+    token: &str,
+) -> Result<LaunchSession> {
+    let mut parts = token.split('.');
+    let header_part = parts.next().context("launch token is missing header")?;
+    let payload_part = parts.next().context("launch token is missing payload")?;
+    let signature_part = parts.next().context("launch token is missing signature")?;
+    if parts.next().is_some() {
+        anyhow::bail!("launch token has too many segments");
+    }
+
+    let header_bytes = URL_SAFE_NO_PAD
+        .decode(header_part)
+        .context("launch token header is not base64url")?;
+    let header: Value =
+        serde_json::from_slice(&header_bytes).context("launch token header is not JSON")?;
+    if header.get("alg").and_then(Value::as_str) != Some("HS256") {
+        anyhow::bail!("launch token must use HS256");
+    }
+
+    let signature = URL_SAFE_NO_PAD
+        .decode(signature_part)
+        .context("launch token signature is not base64url")?;
+    let signing_input = format!("{header_part}.{payload_part}");
+    let key = hmac::Key::new(hmac::HMAC_SHA256, secret.as_bytes());
+    hmac::verify(&key, signing_input.as_bytes(), &signature)
+        .map_err(|_| anyhow::anyhow!("invalid launch token signature"))?;
+
+    let payload_bytes = URL_SAFE_NO_PAD
+        .decode(payload_part)
+        .context("launch token payload is not base64url")?;
+    let claims: LaunchTokenClaims =
+        serde_json::from_slice(&payload_bytes).context("launch token payload is not JSON")?;
+    let now_seconds = (now_millis() / 1000) as usize;
+    if claims.exp.saturating_add(30) < now_seconds {
+        anyhow::bail!("launch token has expired");
+    }
+
+    let user_id = claims.user_id.trim();
+    let tool_id = claims.tool_id.trim();
+
+    if user_id.is_empty() {
+        anyhow::bail!("launch token is missing user_id");
+    }
+    if tool_id != auth.tool_id {
+        anyhow::bail!("launch token tool_id mismatch");
+    }
+
+    Ok(LaunchSession {
+        email: claims
+            .email
+            .map(|email| email.trim().to_owned())
+            .filter(|email| !email.is_empty()),
+        install_id: claims
+            .install_id
+            .map(|install_id| install_id.trim().to_owned())
+            .filter(|install_id| !install_id.is_empty()),
+        tool_id: tool_id.to_owned(),
+        user_id: user_id.to_owned(),
+    })
+}
+
+fn apply_launch_metadata(task: &mut task_core::ChatTask, session: &LaunchSession) {
+    let mut metadata = match task.metadata.take() {
+        Some(Value::Object(metadata)) => metadata,
+        Some(value) => {
+            let mut metadata = Map::new();
+            metadata.insert("client_metadata".to_owned(), value);
+            metadata
+        }
+        None => Map::new(),
+    };
+
+    metadata.insert(
+        "auth_source".to_owned(),
+        Value::String("2ndBrain.ceo".to_owned()),
+    );
+    metadata.insert("tool_id".to_owned(), Value::String(session.tool_id.clone()));
+    metadata.insert("user_id".to_owned(), Value::String(session.user_id.clone()));
+    if let Some(install_id) = session.install_id.as_deref() {
+        metadata.insert(
+            "install_id".to_owned(),
+            Value::String(install_id.to_owned()),
+        );
+    } else {
+        metadata.remove("install_id");
+    }
+    if let Some(email) = session.email.as_deref() {
+        metadata.insert("email".to_owned(), Value::String(email.to_owned()));
+    } else {
+        metadata.remove("email");
+    }
+
+    task.metadata = Some(Value::Object(metadata));
+}
+
+fn task_update_visible_to_session(
+    envelope: &TaskUpdateEnvelope,
+    session: Option<&LaunchSession>,
+    auth_required: bool,
+) -> bool {
+    if !auth_required {
+        return true;
+    }
+
+    let Some(session) = session else {
+        return false;
+    };
+    if envelope.user_id.as_deref() != Some(session.user_id.as_str()) {
+        return false;
+    }
+    if let Some(update_install_id) = envelope.install_id.as_deref() {
+        if let Some(session_install_id) = session.install_id.as_deref() {
+            return update_install_id == session_install_id;
+        }
+    }
+
+    true
 }
 
 fn validate_review_assignment(task: &task_core::ChatTask) -> Result<()> {
@@ -405,7 +645,7 @@ async fn listen_for_results(
                 last_id = message.id.clone();
                 match result_update_from_fields(&message.id, &message.map) {
                     Ok(update) => {
-                        let _ = state.updates.send(PublisherResponse::TaskUpdate(update));
+                        let _ = state.updates.send(update);
                     }
                     Err(err) => {
                         warn!(result_stream_id = %message.id, error = %err, "failed to parse task result");
@@ -419,7 +659,7 @@ async fn listen_for_results(
 fn result_update_from_fields(
     result_stream_id: &str,
     fields: &HashMap<String, redis::Value>,
-) -> Result<TaskUpdate> {
+) -> Result<TaskUpdateEnvelope> {
     let payload = fields
         .get("payload")
         .context("result stream entry is missing payload field")
@@ -427,7 +667,11 @@ fn result_update_from_fields(
             redis::from_redis_value::<String>(value).context("payload field is not a string")
         })?;
     let value: Value = serde_json::from_str(&payload).context("result payload is not JSON")?;
-    Ok(result_update_from_value(result_stream_id, &value))
+    Ok(TaskUpdateEnvelope {
+        install_id: optional_string(value.pointer("/metadata/install_id")),
+        update: result_update_from_value(result_stream_id, &value),
+        user_id: optional_string(value.pointer("/metadata/user_id")),
+    })
 }
 
 fn result_update_from_value(result_stream_id: &str, value: &Value) -> TaskUpdate {
