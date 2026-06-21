@@ -25,7 +25,7 @@ TELEGRAM_BOT_TOKEN=your-bot-token
 TELEGRAM_CHAT_ID=your-chat-id
 ```
 
-The publisher listens on `ws://127.0.0.1:8080/ws` by default.
+The publisher binds to `0.0.0.0:${PORT:-8080}` by default. For local development, connect to `ws://127.0.0.1:8080/ws`.
 
 For public deployments, set `GYNE_AGENT_SESSION_SECRET` on the publisher. When this secret is set, `/ws` and `/consumers` require a short-lived 2ndBrain launch token.
 
@@ -79,6 +79,12 @@ https://gyne-agent-ui.example.com/?token=...&publisher_ws_url=wss://gyne-agent-p
 ```
 
 It reads `token`, `launch_token`, or `2ndbrain_launch_token`, removes the token from the browser address bar, and appends it to the websocket connection.
+
+For single-service deployments, the publisher can also serve the built frontend from `frontend/dist`:
+
+```text
+https://gyne-agent.example.com/?token=...&publisher_ws_url=wss://gyne-agent.example.com/ws
+```
 
 ## Frontend Websocket Payload
 
@@ -182,7 +188,8 @@ Environment variables:
 - `CONSUMER_TASK_STREAM`: per-consumer stream for directly assigned tasks. Default: `${TASK_STREAM}:${CONSUMER_NAME}`
 - `RESULT_STREAM`: stream for worker results. Default: `openclaw:results`
 - `CONSUMER_REGISTRY_KEY`: sorted-set key for consumer discovery. Default: `openclaw:consumers`
-- `PUBLISHER_BIND`: websocket bind address. Default: `127.0.0.1:8080`
+- `PUBLISHER_BIND`: websocket bind address. Default: `0.0.0.0:${PORT:-8080}`
+- `FRONTEND_DIST_DIR`: optional path to the built frontend served by the publisher. Default: `frontend/dist`
 - `DEFAULT_MODEL`: optional default model if frontend payload omits `model`
 - `CONSUMER_GROUP`: Redis consumer group. Default: `openclaw-workers`
 - `CONSUMER_NAME`: Redis consumer name. Required by the consumer so the publisher can assign tasks.
@@ -218,7 +225,7 @@ consumer
 frontend
 ```
 
-Publisher service:
+Single public service:
 
 ```env
 GYNE_AGENT_SERVICE=publisher
@@ -227,7 +234,16 @@ GYNE_AGENT_SESSION_SECRET=long-random-secret
 DEFAULT_MODEL=openclaw
 ```
 
-The start script binds the publisher to `0.0.0.0:$PORT` on Railway when `PUBLISHER_BIND` is not set.
+The publisher serves both `/` and `/ws` in this mode. In 2ndBrain, point both values at the same Railway service:
+
+```env
+GYNE_AGENT_URL=https://gyne-agent-production.up.railway.app
+GYNE_AGENT_WS_URL=wss://gyne-agent-production.up.railway.app/ws
+```
+
+Do not set `PUBLISHER_BIND=127.0.0.1:8080` on Railway. Leave `PUBLISHER_BIND` empty, or set it to `0.0.0.0:${PORT}` if your Railway configuration expands variables. If Railway environment variables are present, the publisher will override an accidental loopback bind to `0.0.0.0:${PORT:-8080}`.
+
+Optional worker service:
 
 Consumer service:
 
@@ -243,6 +259,8 @@ Frontend service:
 ```env
 GYNE_AGENT_SERVICE=frontend
 ```
+
+This is only needed if you want a separate frontend URL. The publisher service already serves the production frontend bundle from `frontend/dist`.
 
 For frontend builds, set `VITE_PUBLISHER_WS_URL` as a Docker build arg when you want a baked-in websocket URL. Otherwise, pass `publisher_ws_url` in the 2ndBrain launch URL.
 

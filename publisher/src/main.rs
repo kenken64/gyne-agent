@@ -15,10 +15,13 @@ use redis::streams::StreamReadReply;
 use ring::hmac;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
-use std::{collections::HashMap, env, net::SocketAddr, sync::Arc};
+use std::{collections::HashMap, env, net::SocketAddr, path::PathBuf, sync::Arc};
 use task_core::{now_millis, ConsumerDiscovery, PublisherResponse, TaskRequest, TaskUpdate};
 use tokio::sync::broadcast;
-use tower_http::trace::TraceLayer;
+use tower_http::{
+    services::{ServeDir, ServeFile},
+    trace::TraceLayer,
+};
 use tracing::{error, info, warn};
 
 #[derive(Clone)]
@@ -71,7 +74,8 @@ async fn main() -> Result<()> {
     dotenvy::dotenv().ok();
     tracing_subscriber::fmt::init();
 
-    let bind: SocketAddr = env_or("PUBLISHER_BIND", "127.0.0.1:8080")
+    let bind_address = publisher_bind_address();
+    let bind: SocketAddr = bind_address
         .parse()
         .context("PUBLISHER_BIND must be a valid socket address")?;
     let redis_url = env_or("REDIS_URL", "redis://127.0.0.1/");
@@ -83,6 +87,7 @@ async fn main() -> Result<()> {
     let result_block_ms = parse_env("RESULT_STREAM_BLOCK_MS", 5_000)?;
     let update_buffer = parse_env("PUBLISHER_UPDATE_BUFFER", 256)?;
     let launch_auth = LaunchAuthConfig::from_env(bind)?;
+    let frontend_dist_dir = frontend_dist_dir();
     let (updates, _) = broadcast::channel(update_buffer);
 
     let state = Arc::new(AppState {
@@ -98,10 +103,26 @@ async fn main() -> Result<()> {
     });
     spawn_result_listener(state.clone());
 
+    let frontend_index = frontend_dist_dir.join("index.html");
+    if frontend_index.exists() {
+        info!(
+            frontend_dist_dir = %frontend_dist_dir.display(),
+            "serving bundled frontend from publisher"
+        );
+    } else {
+        warn!(
+            frontend_dist_dir = %frontend_dist_dir.display(),
+            "frontend dist directory is missing; publisher root will return 404"
+        );
+    }
+
     let app = Router::new()
         .route("/health", get(health))
         .route("/consumers", get(consumers))
         .route("/ws", get(ws_handler))
+        .fallback_service(
+            ServeDir::new(&frontend_dist_dir).not_found_service(ServeFile::new(frontend_index)),
+        )
         .layer(TraceLayer::new_for_http())
         .with_state(state);
 
@@ -824,6 +845,46 @@ async fn send_json<T: Serialize>(
 
 fn env_or(key: &str, default: &str) -> String {
     env::var(key).unwrap_or_else(|_| default.to_owned())
+}
+
+fn publisher_bind_address() -> String {
+    if let Some(bind) = optional_env("PUBLISHER_BIND") {
+        if is_railway_deploy() && is_loopback_bind(&bind) {
+            let railway_bind = public_port_bind_address();
+            warn!(
+                configured_bind = bind,
+                railway_bind, "overriding loopback PUBLISHER_BIND for Railway"
+            );
+            return railway_bind;
+        }
+
+        return bind;
+    }
+
+    public_port_bind_address()
+}
+
+fn public_port_bind_address() -> String {
+    let port = env_or("PORT", "8080");
+    format!("0.0.0.0:{port}")
+}
+
+fn is_railway_deploy() -> bool {
+    optional_env("RAILWAY_ENVIRONMENT").is_some()
+        || optional_env("RAILWAY_PROJECT_ID").is_some()
+        || optional_env("RAILWAY_SERVICE_ID").is_some()
+}
+
+fn is_loopback_bind(bind: &str) -> bool {
+    bind.parse::<SocketAddr>()
+        .map(|address| address.ip().is_loopback())
+        .unwrap_or(false)
+}
+
+fn frontend_dist_dir() -> PathBuf {
+    optional_env("FRONTEND_DIST_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("frontend/dist"))
 }
 
 fn optional_env(key: &str) -> Option<String> {
