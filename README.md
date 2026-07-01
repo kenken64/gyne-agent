@@ -72,6 +72,12 @@ Optional claims:
 
 When launch auth is enabled, the publisher overwrites task metadata fields for `user_id`, `install_id`, `tool_id`, `email`, and `auth_source`. Client-supplied values for those fields are not trusted. Task result broadcasts are filtered so a websocket only receives updates for the same launch user and install.
 
+### Per-owner consumer discovery
+
+When a launch token is present, consumer discovery (`/consumers` and the `list_consumers` websocket message) is scoped to the launching `user_id`. The publisher reads the set `${CONSUMER_OWNER_KEY_PREFIX}:${user_id}` (default prefix `openclaw:owners`) and returns only consumers whose `CONSUMER_NAME` is a member of that set. Task assignment (`assigned_consumer`) is likewise restricted to owned consumers.
+
+2ndBrain is the authority for this map: when it provisions an OpenClaw instance it writes `SADD openclaw:owners:{user_id} {consumer_name}` into the same Redis, and `SREM`s on deprovision. A consumer that is not in any owner set is invisible to every launch user (safe by default). When launch auth is disabled (no `GYNE_AGENT_SESSION_SECRET`), discovery is unscoped as before. This requires the publisher and 2ndBrain to share the same Redis.
+
 The frontend accepts launch URLs like:
 
 ```text
@@ -190,6 +196,7 @@ Environment variables:
 - `CONSUMER_TASK_STREAM`: per-consumer stream for directly assigned tasks. Default: `${TASK_STREAM}:${CONSUMER_NAME}`
 - `RESULT_STREAM`: stream for worker results. Default: `openclaw:results`
 - `CONSUMER_REGISTRY_KEY`: sorted-set key for consumer discovery. Default: `openclaw:consumers`
+- `CONSUMER_OWNER_KEY_PREFIX`: prefix for the per-owner consumer sets used to scope discovery by launch user. Default: `openclaw:owners`. Must match the prefix 2ndBrain writes to.
 - `PUBLISHER_BIND`: websocket bind address. Default: `0.0.0.0:${PORT:-8080}`
 - `FRONTEND_DIST_DIR`: optional path to the built frontend served by the publisher. Default: `frontend/dist`
 - `DEFAULT_MODEL`: optional default model if frontend payload omits `model`

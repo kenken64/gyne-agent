@@ -39,6 +39,7 @@ struct AppState {
     result_stream: String,
     default_model: Option<String>,
     consumer_registry_key: String,
+    owner_registry_prefix: String,
     consumer_stale_after_ms: u64,
     result_block_ms: usize,
     frontend_dist_dir: PathBuf,
@@ -116,6 +117,7 @@ async fn main() -> Result<()> {
     let result_stream = env_or("RESULT_STREAM", "openclaw:results");
     let default_model = optional_env("DEFAULT_MODEL");
     let consumer_registry_key = env_or("CONSUMER_REGISTRY_KEY", "openclaw:consumers");
+    let owner_registry_prefix = env_or("CONSUMER_OWNER_KEY_PREFIX", "openclaw:owners");
     let consumer_stale_after_ms = parse_env("CONSUMER_STALE_AFTER_MS", 15_000)?;
     let result_block_ms = parse_env("RESULT_STREAM_BLOCK_MS", 5_000)?;
     let update_buffer = parse_env("PUBLISHER_UPDATE_BUFFER", 256)?;
@@ -129,6 +131,7 @@ async fn main() -> Result<()> {
         result_stream,
         default_model,
         consumer_registry_key,
+        owner_registry_prefix,
         consumer_stale_after_ms,
         result_block_ms,
         frontend_dist_dir: frontend_dist_dir.clone(),
@@ -176,6 +179,7 @@ async fn health(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
         "task_stream": state.task_stream,
         "result_stream": state.result_stream,
         "consumer_registry_key": state.consumer_registry_key,
+        "owner_registry_prefix": state.owner_registry_prefix,
         "has_default_model": state.default_model.is_some(),
         "launch_auth_required": state.launch_auth.is_required(),
         "launch_liveness_required": state.launch_auth.has_session_verifier(),
@@ -263,8 +267,9 @@ async fn consumers(
             .into_response();
     }
 
+    let owner = launch_owner_id(session.as_ref());
     let response = match state.redis.get_multiplexed_async_connection().await {
-        Ok(mut redis) => match list_consumers(&mut redis, &state).await {
+        Ok(mut redis) => match list_consumers(&mut redis, &state, owner).await {
             Ok(consumers) => PublisherResponse::Consumers { consumers },
             Err(err) => PublisherResponse::Error {
                 message: err.to_string(),
@@ -507,7 +512,7 @@ async fn handle_client_payload_inner(
         .is_some_and(|message_type| message_type == "list_consumers")
     {
         return Ok(PublisherResponse::Consumers {
-            consumers: list_consumers(redis, state).await?,
+            consumers: list_consumers(redis, state, launch_owner_id(session)).await?,
         });
     }
 
@@ -534,7 +539,7 @@ async fn handle_client_payload_inner(
     }
     validate_review_assignment(&task)?;
     let task_id = task.task_id.clone();
-    let publish_stream = task_publish_stream(redis, state, &task).await?;
+    let publish_stream = task_publish_stream(redis, state, &task, launch_owner_id(session)).await?;
     let serialized = serde_json::to_string(&task).context("failed to serialize task")?;
 
     let stream_id: String = redis::cmd("XADD")
@@ -986,12 +991,15 @@ async fn task_publish_stream(
     redis: &mut redis::aio::MultiplexedConnection,
     state: &AppState,
     task: &task_core::ChatTask,
+    owner: Option<&str>,
 ) -> Result<String> {
     let Some(assigned_consumer) = task.assigned_consumer.as_deref() else {
         return Ok(state.task_stream.clone());
     };
 
-    let consumers = list_consumers(redis, state).await?;
+    // `list_consumers` is already scoped to the launching user, so a task can only be routed to a
+    // consumer the caller owns; an unowned target surfaces as "not active".
+    let consumers = list_consumers(redis, state, owner).await?;
     consumers
         .into_iter()
         .find(|consumer| consumer.name == assigned_consumer)
@@ -999,9 +1007,43 @@ async fn task_publish_stream(
         .with_context(|| format!("assigned consumer is not active: {assigned_consumer}"))
 }
 
+/// Owner id (2ndBrain `user_id`) used to scope consumer discovery. `None` when launch auth is
+/// disabled (local/dev), in which case discovery is unfiltered as before.
+fn launch_owner_id(session: Option<&LaunchSession>) -> Option<&str> {
+    session.map(|session| session.user_id.as_str())
+}
+
+/// Field of a consumer's discovery record that is matched against the owner set.
+///
+/// Design A ("2ndBrain owns the map"): 2ndBrain writes each owned `CONSUMER_NAME` into
+/// `openclaw:owners:{user_id}`, so we match on the registry name. If a deployment cannot control the
+/// provisioned `CONSUMER_NAME`, switch this to the hostname the consumer publishes
+/// (`consumer.hostname.as_deref().unwrap_or_default()`) and have 2ndBrain populate the owner set with
+/// hostnames instead — the rest of the flow is unchanged.
+fn consumer_owner_match_key(consumer: &ConsumerDiscovery) -> &str {
+    consumer.name.as_str()
+}
+
+/// Consumer names (or match keys) that belong to `owner_id`, per the 2ndBrain-maintained owner map.
+async fn owned_consumer_keys(
+    redis: &mut redis::aio::MultiplexedConnection,
+    state: &AppState,
+    owner_id: &str,
+) -> Result<std::collections::HashSet<String>> {
+    let key = format!("{}:{owner_id}", state.owner_registry_prefix);
+    let members: Vec<String> = redis::cmd("SMEMBERS")
+        .arg(&key)
+        .query_async(redis)
+        .await
+        .with_context(|| format!("failed to list owned consumers for {owner_id}"))?;
+
+    Ok(members.into_iter().collect())
+}
+
 async fn list_consumers(
     redis: &mut redis::aio::MultiplexedConnection,
     state: &AppState,
+    owner: Option<&str>,
 ) -> Result<Vec<ConsumerDiscovery>> {
     let now = now_millis();
     let cutoff = now.saturating_sub(state.consumer_stale_after_ms);
@@ -1047,6 +1089,11 @@ async fn list_consumers(
                     .context("failed to remove incomplete consumer discovery")?;
             }
         }
+    }
+
+    if let Some(owner_id) = owner {
+        let owned = owned_consumer_keys(redis, state, owner_id).await?;
+        consumers.retain(|consumer| owned.contains(consumer_owner_match_key(consumer)));
     }
 
     consumers.sort_by(|left, right| left.name.cmp(&right.name));
