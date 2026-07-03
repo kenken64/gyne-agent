@@ -52,6 +52,8 @@ export function composeWorkPrompt(input: {
   doneWhen: string[];
   attempt: number;
   previousAttempt?: AttemptRecord | null;
+  /** Pre-formatted reference section (e.g. wiki context) appended after the criteria. */
+  context?: string;
 }): string {
   const sections = [`${input.title}\n\n${input.prompt}`];
 
@@ -64,6 +66,10 @@ export function composeWorkPrompt(input: {
       .map((criterion, index) => `${index + 1}. ${criterion}`)
       .join("\n")}`
   );
+
+  if (input.context?.trim()) {
+    sections.push(input.context.trim());
+  }
 
   const previous = input.previousAttempt;
   if (input.attempt > 1 && previous) {

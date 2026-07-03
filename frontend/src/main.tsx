@@ -69,6 +69,9 @@ interface KanbanCard {
   spec: string;
   doneWhen: string[];
   attachedEvals: AttachedEval[];
+  attachWikiContext: boolean;
+  /** File paths of the wiki pages cited in the last published attempt's prompt. */
+  wikiContextRefs?: string[];
   attempt: number;
   attemptHistory: AttemptRecord[];
   verdict?: SelfReviewVerdict;
@@ -108,6 +111,7 @@ interface DraftCard {
   tagsText: string;
   spec: string;
   doneWhenText: string;
+  attachWikiContext: boolean;
 }
 
 interface PublishQueueItem {
@@ -224,6 +228,7 @@ const initialCards: KanbanCard[] = [
       "Risks and missing data are called out explicitly"
     ],
     attachedEvals: [],
+    attachWikiContext: false,
     attempt: 1,
     attemptHistory: [],
     publishStatus: "draft",
@@ -249,6 +254,7 @@ const initialCards: KanbanCard[] = [
     spec: "",
     doneWhen: [],
     attachedEvals: [],
+    attachWikiContext: false,
     attempt: 1,
     attemptHistory: [],
     publishStatus: "draft",
@@ -332,6 +338,46 @@ async function matchCardEvals(card: KanbanCard): Promise<AttachedEval[] | null> 
           (item as { criterion: string }).criterion.trim() !== ""
       )
       .map((item) => ({ id: item.id, criterion: item.criterion.trim() }));
+  } catch {
+    return null;
+  }
+}
+
+interface WikiContextResult {
+  block: string;
+  refs: string[];
+}
+
+/** Searches the user's 2ndBrain wiki for pages relevant to this card and formats the top
+ * matches as a cited prompt section. Returns null on any failure — the publish proceeds
+ * without context. */
+async function fetchWikiContext(card: KanbanCard): Promise<WikiContextResult | null> {
+  try {
+    const query = new URLSearchParams({ q: `${card.title} ${card.prompt}`, limit: "3" });
+    const response = await brainFetch(`/api/brain/context?${query.toString()}`);
+    const payload = (await response.json()) as { results?: unknown };
+    if (!Array.isArray(payload.results)) {
+      return null;
+    }
+    const results = payload.results
+      .filter(
+        (item): item is { title: string; file_path: string; snippet: string } =>
+          Boolean(item) &&
+          typeof (item as { title?: unknown }).title === "string" &&
+          typeof (item as { file_path?: unknown }).file_path === "string" &&
+          typeof (item as { snippet?: unknown }).snippet === "string"
+      )
+      .filter((item) => item.snippet.trim() !== "");
+    if (results.length === 0) {
+      return null;
+    }
+    const block = [
+      "## Reference context from your wiki",
+      "",
+      "The following excerpts from the requester's knowledge base may be relevant. Follow them where they apply and cite the source path when you rely on one.",
+      ...results.map((item) => `### ${item.title} (${item.file_path})\n\n${item.snippet}`)
+    ].join("\n\n");
+    return { block, refs: results.map((item) => item.file_path) };
   } catch {
     return null;
   }
@@ -729,22 +775,32 @@ function App() {
           : item
       )
     );
-    // Work publishes ask 2ndBrain for matching evals first (bounded by the bridge timeout);
-    // matched criteria gate this attempt exactly like manual done-when entries. A bridge
-    // failure keeps the card's previous attachments so a mid-loop retry doesn't lose its gate.
+    // Work publishes ask 2ndBrain for matching evals and (when the card opts in) wiki context
+    // first, bounded by the bridge timeout. Matched criteria gate this attempt exactly like
+    // manual done-when entries; an eval-match failure keeps the card's previous attachments so
+    // a mid-loop retry doesn't lose its gate. A context failure just publishes without context.
     let cardForPublish = card;
+    let wikiContext: WikiContextResult | null = null;
     if (nextItem.kind === "work") {
-      const matched = await matchCardEvals(card);
-      if (matched) {
-        cardForPublish = { ...card, attachedEvals: matched };
-        setCards((current) =>
-          current.map((item) =>
-            item.id === card.id
-              ? { ...item, attachedEvals: matched, updatedAt: Date.now() }
-              : item
-          )
-        );
-      }
+      const [matched, context] = await Promise.all([
+        matchCardEvals(card),
+        card.attachWikiContext ? fetchWikiContext(card) : Promise.resolve(null)
+      ]);
+      wikiContext = context;
+      const attachedEvals = matched ?? card.attachedEvals;
+      cardForPublish = { ...card, attachedEvals };
+      setCards((current) =>
+        current.map((item) =>
+          item.id === card.id
+            ? {
+                ...item,
+                attachedEvals,
+                wikiContextRefs: context?.refs,
+                updatedAt: Date.now()
+              }
+            : item
+        )
+      );
       if (socket.readyState !== WebSocket.OPEN) {
         clearPendingPublish();
         markCardFailed(nextItem.cardId, "Publisher connection closed while publishing");
@@ -758,7 +814,8 @@ function App() {
           kind: nextItem.kind,
           assignedConsumer,
           excludeConsumer: nextItem.excludeConsumer,
-          projectId: activeProjectIdRef.current || undefined
+          projectId: activeProjectIdRef.current || undefined,
+          wikiContext
         })
       )
     );
@@ -1092,6 +1149,7 @@ function App() {
       assignee: card.assignee,
       assignedConsumer: card.assignedConsumer,
       requiresReview: card.requiresReview,
+      attachWikiContext: card.attachWikiContext,
       dependsOnTaskId: card.dependsOnTaskId,
       autoPublishOnDependency: card.autoPublishOnDependency,
       dueDate: card.dueDate,
@@ -1117,6 +1175,7 @@ function App() {
       assignee: card.assignee,
       assignedConsumer: card.assignedConsumer,
       requiresReview: card.requiresReview,
+      attachWikiContext: card.attachWikiContext,
       dependsOnTaskId: card.dependsOnTaskId,
       autoPublishOnDependency: card.autoPublishOnDependency,
       dueDate: card.dueDate,
@@ -1154,6 +1213,7 @@ function App() {
                 assignee: draft.assignee.trim(),
                 assignedConsumer: draft.assignedConsumer,
                 requiresReview: draft.requiresReview,
+                attachWikiContext: draft.attachWikiContext,
                 dependsOnTaskId: draft.column === "backlog" ? draft.dependsOnTaskId : "",
                 autoPublishOnDependency:
                   draft.column === "backlog" ? draft.autoPublishOnDependency : false,
@@ -1203,6 +1263,7 @@ function App() {
         assignee: draft.assignee.trim(),
         assignedConsumer: draft.assignedConsumer,
         requiresReview: draft.requiresReview,
+        attachWikiContext: draft.attachWikiContext,
         dependsOnTaskId: draft.column === "backlog" ? draft.dependsOnTaskId : "",
         autoPublishOnDependency:
           draft.column === "backlog" ? draft.autoPublishOnDependency : false,
@@ -1792,6 +1853,18 @@ function App() {
               <Field label="Consumer" value={selectedCard.assignedConsumer || "Auto"} />
               <Field label="Review" value={selectedCard.requiresReview ? "Required" : "Off"} />
               <Field
+                label="Wiki Context"
+                value={
+                  selectedCard.attachWikiContext
+                    ? selectedCard.wikiContextRefs?.length
+                      ? `${selectedCard.wikiContextRefs.length} page${
+                          selectedCard.wikiContextRefs.length === 1 ? "" : "s"
+                        } cited`
+                      : "On"
+                    : "Off"
+                }
+              />
+              <Field
                 label="Attempt"
                 value={
                   effectiveDoneWhen(selectedCard).length > 0
@@ -2319,6 +2392,20 @@ function App() {
               <span>AI cross-review: route the completion to a second consumer for an independent check</span>
             </label>
 
+            <label className="checkbox-field">
+              <input
+                type="checkbox"
+                checked={draft.attachWikiContext}
+                onChange={(event) =>
+                  setDraft((current) => ({
+                    ...current,
+                    attachWikiContext: event.target.checked
+                  }))
+                }
+              />
+              <span>Attach wiki context: search your 2ndBrain wiki at publish and cite the top matches in the prompt</span>
+            </label>
+
             <footer>
               <button type="button" className="secondary-button" onClick={() => setIsEditorOpen(false)}>
                 <X size={18} />
@@ -2539,6 +2626,7 @@ function toPublisherPayload(
     assignedConsumer?: string;
     excludeConsumer?: string;
     projectId?: string;
+    wikiContext?: WikiContextResult | null;
   }
 ) {
   const isReview = options.kind === "review";
@@ -2546,6 +2634,7 @@ function toPublisherPayload(
   const doneWhen = effectiveDoneWhen(card);
   const gated = !isReview && doneWhen.length > 0;
   const lastRejected = gated ? lastRejectedAttempt(card) : null;
+  const wikiContext = isReview ? null : options.wikiContext ?? null;
 
   return {
     task_id: isReview ? undefined : card.taskId,
@@ -2563,9 +2652,10 @@ function toPublisherPayload(
                 spec: card.spec,
                 doneWhen,
                 attempt: card.attempt,
-                previousAttempt: lastRejected
+                previousAttempt: lastRejected,
+                context: wikiContext?.block
               })
-            : `${card.title}\n\n${card.prompt}`
+            : `${card.title}\n\n${card.prompt}${wikiContext ? `\n\n${wikiContext.block}` : ""}`
       }
     ],
     metadata: {
@@ -2586,6 +2676,7 @@ function toPublisherPayload(
       spec: card.spec || null,
       done_when: doneWhen,
       attached_eval_ids: card.attachedEvals.map((attached) => attached.id),
+      context_refs: wikiContext?.refs ?? [],
       attempt: card.attempt,
       parent_task_id: lastRejected?.taskId ?? null,
       feedback: lastRejected?.humanFeedback ?? null,
@@ -2670,6 +2761,10 @@ function loadCards(projectId: string) {
                   typeof item.criterion === "string"
               )
             : [],
+          attachWikiContext: Boolean(card.attachWikiContext),
+          wikiContextRefs: Array.isArray(card.wikiContextRefs)
+            ? card.wikiContextRefs.filter((item) => typeof item === "string")
+            : undefined,
           attempt: typeof card.attempt === "number" && card.attempt > 0 ? card.attempt : 1,
           attemptHistory: Array.isArray(card.attemptHistory) ? card.attemptHistory : []
         }))
@@ -2694,7 +2789,8 @@ function newDraft(): DraftCard {
     dueDate: todayPlus(2),
     tagsText: "",
     spec: "",
-    doneWhenText: ""
+    doneWhenText: "",
+    attachWikiContext: false
   };
 }
 

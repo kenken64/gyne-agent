@@ -174,6 +174,7 @@ async fn main() -> Result<()> {
             get(brain_evals).post(brain_evals_post).patch(brain_evals_patch),
         )
         .route("/api/brain/evals/match", get(brain_evals_match))
+        .route("/api/brain/context", get(brain_context))
         .route("/ws", get(ws_handler))
         .fallback(frontend_handler)
         .layer(TraceLayer::new_for_http())
@@ -544,6 +545,38 @@ async fn brain_evals_patch(
         &[],
         Some(&body),
         None,
+    )
+    .await
+}
+
+/// Proxies owner-scoped wiki full-text search for publish-time context injection
+/// (`?q=title+prompt&limit=3`).
+async fn brain_context(
+    Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+    State(state): State<Arc<AppState>>,
+) -> axum::response::Response {
+    let session = match brain_bridge_session(&state, &params, &headers, "context").await {
+        Ok(session) => session,
+        Err(response) => return response,
+    };
+
+    let mut query: Vec<(&str, &str)> = Vec::new();
+    if let Some(q) = params.get("q") {
+        query.push(("q", q.as_str()));
+    }
+    if let Some(limit) = params.get("limit") {
+        query.push(("limit", limit.as_str()));
+    }
+
+    forward_brain_request(
+        &state,
+        session.as_ref(),
+        reqwest::Method::GET,
+        "/api/gyne/context",
+        &query,
+        None,
+        Some(json!({ "results": [] })),
     )
     .await
 }
