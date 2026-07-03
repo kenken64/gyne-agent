@@ -46,6 +46,10 @@ struct AppState {
     launch_auth: LaunchAuthConfig,
     launch_verify_client: reqwest::Client,
     updates: broadcast::Sender<TaskUpdateEnvelope>,
+    // Server-to-server bridge to 2ndBrain (`/api/brain/*` proxy routes). The browser never holds
+    // this secret; it authenticates to the publisher with its launch session cookie instead.
+    brain_api_url: Option<String>,
+    brain_api_secret: Option<String>,
 }
 
 #[derive(Clone)]
@@ -138,6 +142,8 @@ async fn main() -> Result<()> {
         launch_auth,
         launch_verify_client: reqwest::Client::new(),
         updates,
+        brain_api_url: optional_env("GYNE_BRAIN_API_URL"),
+        brain_api_secret: optional_env("GYNE_BRAIN_API_SECRET"),
     });
     spawn_result_listener(state.clone());
 
@@ -158,6 +164,7 @@ async fn main() -> Result<()> {
         .route("/health", get(health))
         .route("/consumers", get(consumers))
         .route("/api/session", get(session_status))
+        .route("/api/brain/projects", get(brain_projects))
         .route("/ws", get(ws_handler))
         .fallback(frontend_handler)
         .layer(TraceLayer::new_for_http())
@@ -281,6 +288,79 @@ async fn consumers(
     };
 
     Json(response).into_response()
+}
+
+/// Proxies the launching user's 2ndBrain project list. The browser authenticates with its
+/// launch session cookie; the publisher forwards server-to-server with the bridge secret and
+/// the session's user_id, mirroring `verify_launch_session_active`.
+async fn brain_projects(
+    Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+    State(state): State<Arc<AppState>>,
+) -> axum::response::Response {
+    let session = match launch_session_from_request(&state.launch_auth, &params, &headers) {
+        Ok(Some(session)) => session,
+        Ok(None) => {
+            // Launch auth disabled (local dev): no user to scope by, so no projects.
+            return Json(json!({ "projects": [] })).into_response();
+        }
+        Err(err) => {
+            warn!(error = %err, "brain projects auth failed");
+            return (
+                StatusCode::UNAUTHORIZED,
+                "valid 2ndBrain launch session is required",
+            )
+                .into_response();
+        }
+    };
+
+    if let Err(err) = verify_launch_session_active(&state, Some(&session)).await {
+        warn!(error = %err, "brain projects launch session inactive");
+        return (
+            StatusCode::UNAUTHORIZED,
+            "2ndBrain launch session is no longer active",
+        )
+            .into_response();
+    }
+
+    let (Some(base_url), Some(secret)) = (
+        state.brain_api_url.as_deref(),
+        state.brain_api_secret.as_deref(),
+    ) else {
+        return Json(json!({ "projects": [] })).into_response();
+    };
+
+    let url = format!("{}/api/gyne/projects", base_url.trim_end_matches('/'));
+    let response = state
+        .launch_verify_client
+        .get(&url)
+        .bearer_auth(secret)
+        .query(&[("user_id", session.user_id.as_str())])
+        .send()
+        .await;
+
+    match response {
+        Ok(upstream) => {
+            let status = StatusCode::from_u16(upstream.status().as_u16())
+                .unwrap_or(StatusCode::BAD_GATEWAY);
+            match upstream.text().await {
+                Ok(body) => (
+                    status,
+                    [(header::CONTENT_TYPE, "application/json")],
+                    body,
+                )
+                    .into_response(),
+                Err(err) => {
+                    warn!(error = %err, "brain projects upstream body failed");
+                    (StatusCode::BAD_GATEWAY, "2ndBrain bridge response failed").into_response()
+                }
+            }
+        }
+        Err(err) => {
+            warn!(error = %err, "brain projects upstream request failed");
+            (StatusCode::BAD_GATEWAY, "2ndBrain bridge request failed").into_response()
+        }
+    }
 }
 
 async fn session_status(

@@ -6,18 +6,30 @@ import {
   Circle,
   ClipboardList,
   Copy,
+  ListChecks,
   Loader2,
   MessageSquareText,
   Plus,
   RefreshCw,
   RotateCcw,
   Send,
+  ThumbsDown,
+  ThumbsUp,
   Trash2,
   Users,
   Wifi,
   WifiOff,
   X
 } from "lucide-react";
+import {
+  completionText,
+  composeWorkPrompt,
+  parseDoneWhen,
+  parseSelfReview,
+  stripVerdictBlock,
+  type AttemptRecord,
+  type SelfReviewVerdict
+} from "./verdict";
 import "./styles.css";
 
 type ColumnId = "backlog" | "ready" | "in_progress" | "review" | "done";
@@ -47,6 +59,12 @@ interface KanbanCard {
   autoPublishOnDependency: boolean;
   dueDate: string;
   tags: string[];
+  spec: string;
+  doneWhen: string[];
+  attempt: number;
+  attemptHistory: AttemptRecord[];
+  verdict?: SelfReviewVerdict;
+  awaitingApproval?: boolean;
   publishStatus: PublishStatus;
   streamId?: string;
   error?: string;
@@ -80,12 +98,20 @@ interface DraftCard {
   autoPublishOnDependency: boolean;
   dueDate: string;
   tagsText: string;
+  spec: string;
+  doneWhenText: string;
 }
 
 interface PublishQueueItem {
   cardId: string;
   kind: PublishKind;
   excludeConsumer?: string;
+}
+
+/** A 2ndBrain project this account owns; each project gets its own kanban board. */
+interface ProjectRef {
+  id: string;
+  name: string;
 }
 
 interface PublisherAccepted {
@@ -129,6 +155,8 @@ interface PublisherTaskUpdate {
   consumer?: string;
   result_stream_id?: string;
   completed_at_ms?: number;
+  /** Raw LLM completion JSON relayed by the publisher; the self-review verdict is parsed from it. */
+  response?: unknown;
 }
 
 type PublisherResponse =
@@ -156,6 +184,8 @@ const launchToken = readLaunchToken();
 const defaultWsUrl = launchPublisherWsUrl();
 const authCheckIntervalMs = 15000;
 const storageKey = "gyne-agent-kanban";
+const activeProjectStorageKey = `${storageKey}:active-project`;
+const projectsCacheKey = `${storageKey}:projects`;
 const singaporeTimeZone = "Asia/Singapore";
 const singaporeTimeZoneLabel = "SGT";
 
@@ -180,6 +210,13 @@ const initialCards: KanbanCard[] = [
     autoPublishOnDependency: false,
     dueDate: todayPlus(1),
     tags: ["triage", "handoff"],
+    spec: "",
+    doneWhen: [
+      "Every intake note is represented in the handoff",
+      "Risks and missing data are called out explicitly"
+    ],
+    attempt: 1,
+    attemptHistory: [],
     publishStatus: "draft",
     createdAt: Date.now(),
     updatedAt: Date.now()
@@ -200,6 +237,10 @@ const initialCards: KanbanCard[] = [
     autoPublishOnDependency: false,
     dueDate: todayPlus(3),
     tags: ["checklist"],
+    spec: "",
+    doneWhen: [],
+    attempt: 1,
+    attemptHistory: [],
     publishStatus: "draft",
     createdAt: Date.now(),
     updatedAt: Date.now()
@@ -279,7 +320,9 @@ function LaunchExpired({ message }: { message: string }) {
 }
 
 function App() {
-  const [cards, setCards] = React.useState<KanbanCard[]>(loadCards);
+  const [projects, setProjects] = React.useState<ProjectRef[]>(loadCachedProjects);
+  const [activeProjectId, setActiveProjectId] = React.useState<string>(loadActiveProjectId);
+  const [cards, setCards] = React.useState<KanbanCard[]>(() => loadCards(loadActiveProjectId()));
   const [selectedId, setSelectedId] = React.useState<string | null>(
     cards[0]?.id ?? null
   );
@@ -297,6 +340,8 @@ function App() {
   const [lastEvent, setLastEvent] = React.useState("Disconnected");
   const [authExpired, setAuthExpired] = React.useState(false);
   const [authExpiredMessage, setAuthExpiredMessage] = React.useState("");
+  const [rejectFeedback, setRejectFeedback] = React.useState("");
+  const [isRejectOpen, setIsRejectOpen] = React.useState(false);
   const socketRef = React.useRef<WebSocket | null>(null);
   const pendingCardRef = React.useRef<string | null>(null);
   const pendingKindRef = React.useRef<PublishKind>("work");
@@ -305,19 +350,64 @@ function App() {
   const queueRef = React.useRef<PublishQueueItem[]>([]);
   const cardsRef = React.useRef<KanbanCard[]>(cards);
   const consumersRef = React.useRef<ConsumerDiscovery[]>(consumers);
+  const activeProjectIdRef = React.useRef<string>(activeProjectId);
 
   const selectedCard = cards.find((card) => card.id === selectedId) ?? null;
   const queuedCount = cards.filter((card) => card.publishStatus === "queued").length;
   const connectedConsumerCount = consumers.length;
 
   React.useEffect(() => {
-    localStorage.setItem(storageKey, JSON.stringify(cards));
+    localStorage.setItem(storageKeyForProject(activeProjectId), JSON.stringify(cards));
     cardsRef.current = cards;
-  }, [cards]);
+  }, [cards, activeProjectId]);
+
+  React.useEffect(() => {
+    activeProjectIdRef.current = activeProjectId;
+    localStorage.setItem(activeProjectStorageKey, activeProjectId);
+  }, [activeProjectId]);
+
+  React.useEffect(() => {
+    let cancelled = false;
+
+    async function fetchProjects() {
+      try {
+        const response = await fetch("/api/brain/projects", { cache: "no-store" });
+        if (!response.ok) {
+          return;
+        }
+
+        const payload = (await response.json().catch(() => null)) as
+          | { projects?: ProjectRef[] }
+          | null;
+        if (cancelled || !payload || !Array.isArray(payload.projects)) {
+          return;
+        }
+
+        const list = payload.projects.filter(
+          (project) =>
+            Boolean(project) && typeof project.id === "string" && typeof project.name === "string"
+        );
+        setProjects(list);
+        localStorage.setItem(projectsCacheKey, JSON.stringify(list));
+      } catch {
+        // The board still works with the cached project list (or just the default board).
+      }
+    }
+
+    fetchProjects();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   React.useEffect(() => {
     consumersRef.current = consumers;
   }, [consumers]);
+
+  React.useEffect(() => {
+    setRejectFeedback("");
+    setIsRejectOpen(false);
+  }, [selectedId]);
 
   React.useEffect(() => {
     return () => {
@@ -513,7 +603,8 @@ function App() {
         toPublisherPayload(card, {
           kind: nextItem.kind,
           assignedConsumer,
-          excludeConsumer: nextItem.excludeConsumer
+          excludeConsumer: nextItem.excludeConsumer,
+          projectId: activeProjectIdRef.current || undefined
         })
       )
     );
@@ -651,6 +742,7 @@ function App() {
     const matchedCard = cardsRef.current.find((card) => taskUpdateKind(card, update));
     const updateKind = matchedCard ? taskUpdateKind(matchedCard, update) : null;
     const status = normalizeUpdateStatus(update.status);
+    const matchedGated = Boolean(matchedCard && matchedCard.doneWhen.length > 0);
     const shouldRouteReview =
       matchedCard &&
       updateKind === "work" &&
@@ -659,8 +751,10 @@ function App() {
       !matchedCard.reviewTaskId &&
       !matchedCard.reviewCompletedAt &&
       !isQueuedOrPending(matchedCard.id, "review");
+    // Cards with acceptance criteria release their dependents on human Approve, not here.
     const completedDependencyTaskId =
       matchedCard &&
+      !matchedGated &&
       status === "done" &&
       (updateKind === "review" || (updateKind === "work" && !shouldRouteReview))
         ? matchedCard.taskId
@@ -684,11 +778,17 @@ function App() {
           return card;
         }
 
+        const gated = card.doneWhen.length > 0;
+
         if (kind === "review") {
+          // With acceptance criteria the AI cross-review is evidence, not a gate
+          // release: the card stays in Review awaiting the human decision.
+          const gateHere = gated && status === "done";
           return {
             ...card,
-            column: columnForReviewUpdateStatus(status),
+            column: gateHere ? ("review" as ColumnId) : columnForReviewUpdateStatus(status),
             publishStatus: status,
+            awaitingApproval: gateHere ? true : card.awaitingApproval,
             error: status === "failed" ? update.error || update.message : undefined,
             reviewError:
               status === "failed" || status === "needs_input"
@@ -710,12 +810,46 @@ function App() {
           !card.reviewCompletedAt &&
           !isQueuedOrPending(card.id, "review");
 
+        const fullText = completionText(update.response) ?? update.message ?? "";
+        const parsedVerdict =
+          gated && (status === "done" || status === "needs_input")
+            ? parseSelfReview(fullText)
+            : null;
+        // A gated completion without a parseable verdict still stops at Review,
+        // flagged so the reviewer knows the self-review is missing.
+        const nextVerdict: SelfReviewVerdict | undefined =
+          gated && status === "done"
+            ? parsedVerdict ?? { criteria: [], overallPass: false, parseError: true }
+            : parsedVerdict ?? card.verdict;
+        const displayMessage =
+          gated && fullText ? stripVerdictBlock(fullText) || update.message : update.message;
+        const attemptRecord =
+          gated && status === "done"
+            ? {
+                attempt: card.attempt,
+                taskId: card.taskId,
+                output: displayMessage ?? "",
+                verdict: nextVerdict,
+                consumer: update.consumer,
+                completedAt: update.completed_at_ms ?? Date.now()
+              }
+            : null;
+
         return {
           ...card,
-          column: routeReview ? "review" : columnForUpdateStatus(status, card.column),
-          publishStatus: routeReview ? "queued" : status,
+          column:
+            routeReview || (gated && status === "done")
+              ? ("review" as ColumnId)
+              : columnForUpdateStatus(status, card.column),
+          publishStatus: routeReview ? ("queued" as PublishStatus) : status,
+          awaitingApproval:
+            gated && status === "done" && !routeReview ? true : card.awaitingApproval,
+          verdict: nextVerdict,
+          attemptHistory: attemptRecord
+            ? upsertAttempt(card.attemptHistory, attemptRecord)
+            : card.attemptHistory,
           error: status === "failed" ? update.error || update.message : undefined,
-          resultMessage: update.message,
+          resultMessage: displayMessage,
           resultStreamId: update.result_stream_id,
           completedAt: update.completed_at_ms,
           questions: update.questions ?? [],
@@ -748,6 +882,29 @@ function App() {
     );
   }
 
+  // Each project keeps its own board; switching saves nothing extra (boards persist
+  // on every change) and drops publish state, which is board-scoped.
+  function switchProject(projectId: string) {
+    if (projectId === activeProjectId) {
+      return;
+    }
+
+    const nextCards = loadCards(projectId);
+    queueRef.current = [];
+    setPublishQueue([]);
+    clearPendingPublish();
+    setActiveProjectId(projectId);
+    setCards(nextCards);
+    setSelectedId(nextCards[0]?.id ?? null);
+    setIsEditorOpen(false);
+    setReworkMode(false);
+    setLastEvent(
+      projectId
+        ? `Switched to ${projects.find((project) => project.id === projectId)?.name ?? "project"} board`
+        : "Switched to default board"
+    );
+  }
+
   function openNewCard(column: ColumnId) {
     setDraft({ ...newDraft(), column });
     setSelectedId(null);
@@ -768,7 +925,9 @@ function App() {
       dependsOnTaskId: card.dependsOnTaskId,
       autoPublishOnDependency: card.autoPublishOnDependency,
       dueDate: card.dueDate,
-      tagsText: card.tags.join(", ")
+      tagsText: card.tags.join(", "),
+      spec: card.spec,
+      doneWhenText: card.doneWhen.join("\n")
     });
     setSelectedId(card.id);
     setReworkMode(false);
@@ -791,7 +950,9 @@ function App() {
       dependsOnTaskId: card.dependsOnTaskId,
       autoPublishOnDependency: card.autoPublishOnDependency,
       dueDate: card.dueDate,
-      tagsText: card.tags.join(", ")
+      tagsText: card.tags.join(", "),
+      spec: card.spec,
+      doneWhenText: card.doneWhen.join("\n")
     });
     setSelectedId(card.id);
     setReworkMode(true);
@@ -807,6 +968,7 @@ function App() {
     }
 
     const tags = parseTags(draft.tagsText);
+    const doneWhen = parseDoneWhen(draft.doneWhenText);
 
     if (selectedId) {
       setCards((current) =>
@@ -827,8 +989,15 @@ function App() {
                   draft.column === "backlog" ? draft.autoPublishOnDependency : false,
                 dueDate: draft.dueDate,
                 tags,
-                // Rework re-runs as a brand new task: fresh id, clean draft status.
+                spec: draft.spec.trim(),
+                doneWhen,
+                // Rework re-runs as a brand new task: fresh id, clean draft status,
+                // and the approval loop starts over from attempt 1.
                 taskId: reworkMode ? crypto.randomUUID() : card.taskId,
+                attempt: reworkMode ? 1 : card.attempt,
+                attemptHistory: reworkMode ? [] : card.attemptHistory,
+                verdict: undefined,
+                awaitingApproval: false,
                 publishStatus:
                   reworkMode || card.publishStatus === "queued" ? "draft" : card.publishStatus,
                 streamId: undefined,
@@ -868,6 +1037,10 @@ function App() {
           draft.column === "backlog" ? draft.autoPublishOnDependency : false,
         dueDate: draft.dueDate,
         tags,
+        spec: draft.spec.trim(),
+        doneWhen,
+        attempt: 1,
+        attemptHistory: [],
         publishStatus: "draft",
         createdAt: Date.now(),
         updatedAt: Date.now()
@@ -922,6 +1095,8 @@ function App() {
               ...item,
               publishStatus: "draft",
               error: undefined,
+              verdict: undefined,
+              awaitingApproval: false,
               reviewTaskId: undefined,
               reviewStreamId: undefined,
               reviewConsumer: undefined,
@@ -993,6 +1168,99 @@ function App() {
       connect();
     }
     setLastEvent(`Retrying ${card.title}`);
+  }
+
+  // Human gate: confirm the goal is achieved. Only now does the card count as
+  // Done for dependents — the agent's own "done" status never releases them.
+  function approveCard(cardId: string) {
+    const card = cardsRef.current.find((item) => item.id === cardId);
+    if (!card || !card.awaitingApproval) {
+      return;
+    }
+
+    const autoPublishIds = cardsRef.current
+      .filter(
+        (item) =>
+          item.column === "backlog" &&
+          item.dependsOnTaskId === card.taskId &&
+          item.autoPublishOnDependency &&
+          !isPublishing(item)
+      )
+      .map((item) => item.id);
+
+    setCards((current) =>
+      releaseDependentCards(
+        current.map((item) =>
+          item.id === cardId
+            ? {
+                ...item,
+                column: "done" as ColumnId,
+                publishStatus: "done" as PublishStatus,
+                awaitingApproval: false,
+                attemptHistory: finalizeAttempt(item, "approved"),
+                updatedAt: Date.now()
+              }
+            : item
+        ),
+        card.taskId
+      )
+    );
+
+    if (autoPublishIds.length > 0) {
+      enqueueCards(autoPublishIds, "work");
+      if (socketStatus === "closed") {
+        connect();
+      }
+    }
+    setLastEvent(`Approved ${card.title}`);
+  }
+
+  // Reject with feedback: the developer steers the agent. The next attempt runs
+  // on the same consumer with the rejected output and this feedback in context.
+  function rejectCard(cardId: string, feedback: string) {
+    const card = cardsRef.current.find((item) => item.id === cardId);
+    const trimmed = feedback.trim();
+    if (!card || !card.awaitingApproval || !trimmed) {
+      return;
+    }
+
+    setCards((current) =>
+      current.map((item) =>
+        item.id === cardId
+          ? {
+              ...item,
+              attemptHistory: finalizeAttempt(item, "rejected", trimmed),
+              attempt: item.attempt + 1,
+              taskId: crypto.randomUUID(),
+              assignedConsumer: item.completedBy || item.assignedConsumer,
+              awaitingApproval: false,
+              verdict: undefined,
+              publishStatus: "draft" as PublishStatus,
+              column: "in_progress" as ColumnId,
+              streamId: undefined,
+              error: undefined,
+              resultMessage: undefined,
+              resultStreamId: undefined,
+              completedAt: undefined,
+              questions: undefined,
+              reviewTaskId: undefined,
+              reviewStreamId: undefined,
+              reviewConsumer: undefined,
+              reviewedBy: undefined,
+              reviewError: undefined,
+              reviewRequestedAt: undefined,
+              reviewCompletedAt: undefined,
+              updatedAt: Date.now()
+            }
+          : item
+      )
+    );
+
+    enqueueCards([cardId], "work");
+    if (socketStatus === "closed") {
+      connect();
+    }
+    setLastEvent(`Rejected ${card.title} — running attempt ${card.attempt + 1}`);
   }
 
   function publishColumn(column: ColumnId) {
@@ -1127,6 +1395,24 @@ function App() {
         </div>
 
         <div className="connection-panel">
+          <label className="project-switcher">
+            <span>Project</span>
+            <select
+              value={activeProjectId}
+              onChange={(event) => switchProject(event.target.value)}
+            >
+              <option value="">Default board</option>
+              {activeProjectId &&
+              !projects.some((project) => project.id === activeProjectId) ? (
+                <option value={activeProjectId}>Unknown project</option>
+              ) : null}
+              {projects.map((project) => (
+                <option key={project.id} value={project.id}>
+                  {project.name}
+                </option>
+              ))}
+            </select>
+          </label>
           <label className="ws-input">
             <span>Publisher</span>
             <input
@@ -1287,6 +1573,22 @@ function App() {
               <Field label="Owner" value={selectedCard.assignee || "Unassigned"} />
               <Field label="Consumer" value={selectedCard.assignedConsumer || "Auto"} />
               <Field label="Review" value={selectedCard.requiresReview ? "Required" : "Off"} />
+              <Field
+                label="Attempt"
+                value={
+                  selectedCard.doneWhen.length > 0
+                    ? String(selectedCard.attempt)
+                    : "—"
+                }
+              />
+              <Field
+                label="Criteria"
+                value={
+                  selectedCard.doneWhen.length > 0
+                    ? `${selectedCard.doneWhen.length} defined`
+                    : "None"
+                }
+              />
               <Field label="Completed By" value={selectedCard.completedBy || "None"} />
               <Field
                 label="Completed At"
@@ -1343,6 +1645,139 @@ function App() {
                   </ul>
                 ) : null}
               </div>
+            ) : null}
+            {selectedCard.verdict ? (
+              <div className="verdict-panel">
+                <div className="panel-title">
+                  <ListChecks size={18} />
+                  <span>Self-review</span>
+                  <span
+                    className={`verdict-badge ${
+                      selectedCard.verdict.parseError
+                        ? "missing"
+                        : selectedCard.verdict.overallPass
+                          ? "pass"
+                          : "fail"
+                    }`}
+                  >
+                    {selectedCard.verdict.parseError
+                      ? "No self-review found"
+                      : selectedCard.verdict.overallPass
+                        ? "All criteria pass"
+                        : "Criteria failing"}
+                  </span>
+                </div>
+                {selectedCard.verdict.criteria.map((criterion, index) => (
+                  <div
+                    className={`verdict-row ${criterion.pass ? "pass" : "fail"}`}
+                    key={`${index}-${criterion.criterion}`}
+                  >
+                    {criterion.pass ? <Check size={15} /> : <X size={15} />}
+                    <div>
+                      <strong>{criterion.criterion}</strong>
+                      {criterion.evidence ? <span>{criterion.evidence}</span> : null}
+                    </div>
+                  </div>
+                ))}
+                {selectedCard.verdict.notes ? (
+                  <p className="verdict-notes">{selectedCard.verdict.notes}</p>
+                ) : null}
+              </div>
+            ) : null}
+            {selectedCard.awaitingApproval ? (
+              <div className="approval-panel">
+                <div className="panel-title">
+                  <ThumbsUp size={18} />
+                  <span>Confirm goal achieved?</span>
+                </div>
+                <p>
+                  Approve to move this task to Done and release dependents, or reject
+                  with feedback to run attempt {selectedCard.attempt + 1} on the same
+                  consumer.
+                </p>
+                {isRejectOpen ? (
+                  <>
+                    <textarea
+                      className="reject-feedback"
+                      placeholder="What is wrong or missing? This feedback is sent to the agent together with the rejected output."
+                      value={rejectFeedback}
+                      onChange={(event) => setRejectFeedback(event.target.value)}
+                    />
+                    <div className="approval-actions">
+                      <button
+                        className="secondary-button"
+                        onClick={() => {
+                          setIsRejectOpen(false);
+                          setRejectFeedback("");
+                        }}
+                      >
+                        <X size={16} />
+                        Cancel
+                      </button>
+                      <button
+                        className="secondary-button reject-confirm"
+                        disabled={!rejectFeedback.trim()}
+                        onClick={() => {
+                          rejectCard(selectedCard.id, rejectFeedback);
+                          setRejectFeedback("");
+                          setIsRejectOpen(false);
+                        }}
+                      >
+                        <ThumbsDown size={16} />
+                        Reject &amp; rerun
+                      </button>
+                    </div>
+                  </>
+                ) : (
+                  <div className="approval-actions">
+                    <button
+                      className="secondary-button"
+                      onClick={() => setIsRejectOpen(true)}
+                    >
+                      <ThumbsDown size={16} />
+                      Reject
+                    </button>
+                    <button
+                      className="primary-button"
+                      onClick={() => approveCard(selectedCard.id)}
+                    >
+                      <ThumbsUp size={16} />
+                      Approve
+                    </button>
+                  </div>
+                )}
+              </div>
+            ) : null}
+            {selectedCard.attemptHistory.length > 0 ? (
+              <details className="attempt-history">
+                <summary>Attempts ({selectedCard.attemptHistory.length})</summary>
+                <div className="attempt-list">
+                  {[...selectedCard.attemptHistory].reverse().map((record) => (
+                    <div className="attempt-row" key={record.attempt}>
+                      <header>
+                        <strong>Attempt {record.attempt}</strong>
+                        <span className={`attempt-action ${record.humanAction ?? "pending"}`}>
+                          {record.humanAction === "approved"
+                            ? "Approved"
+                            : record.humanAction === "rejected"
+                              ? "Rejected"
+                              : "Awaiting decision"}
+                        </span>
+                      </header>
+                      {record.humanFeedback ? (
+                        <p className="attempt-feedback">{record.humanFeedback}</p>
+                      ) : null}
+                      {record.output ? (
+                        <p className="attempt-output">{record.output}</p>
+                      ) : null}
+                      <span className="attempt-meta">
+                        {record.consumer ? `${record.consumer} · ` : ""}
+                        {formatTime(record.completedAt)}
+                      </span>
+                    </div>
+                  ))}
+                </div>
+              </details>
             ) : null}
             {selectedCard.error ? (
               <div className="error-panel">{selectedCard.error}</div>
@@ -1402,6 +1837,35 @@ function App() {
                 required
               />
             </label>
+
+            <label>
+              <span>Spec (context &amp; constraints)</span>
+              <textarea
+                value={draft.spec}
+                placeholder="Background, constraints, and product context the agent should honor."
+                onChange={(event) =>
+                  setDraft((current) => ({ ...current, spec: event.target.value }))
+                }
+              />
+            </label>
+
+            <label>
+              <span>Done when (one acceptance criterion per line)</span>
+              <textarea
+                value={draft.doneWhenText}
+                placeholder={"The summary covers every intake note\nRisks and missing data are called out explicitly"}
+                onChange={(event) =>
+                  setDraft((current) => ({ ...current, doneWhenText: event.target.value }))
+                }
+              />
+            </label>
+
+            {parseDoneWhen(draft.doneWhenText).length > 0 ? (
+              <p className="editor-hint">
+                With acceptance criteria set, the agent self-reviews its output and the
+                task waits in Review for your approval before it counts as Done.
+              </p>
+            ) : null}
 
             <div className="form-row">
               <label>
@@ -1583,7 +2047,7 @@ function App() {
                   }))
                 }
               />
-              <span>Route completion to another consumer for review</span>
+              <span>AI cross-review: route the completion to a second consumer for an independent check</span>
             </label>
 
             <footer>
@@ -1638,7 +2102,14 @@ function KanbanCardView({
     >
       <header>
         <span className={`priority ${card.priority}`}>{priorityLabels[card.priority]}</span>
-        <StatusBadge status={card.publishStatus} />
+        {card.awaitingApproval ? (
+          <span className="publish-status approval">
+            <ThumbsUp size={14} />
+            Approve?
+          </span>
+        ) : (
+          <StatusBadge status={card.publishStatus} />
+        )}
       </header>
       <h3>{card.title}</h3>
       <p>{card.prompt}</p>
@@ -1798,10 +2269,13 @@ function toPublisherPayload(
     kind: PublishKind;
     assignedConsumer?: string;
     excludeConsumer?: string;
+    projectId?: string;
   }
 ) {
   const isReview = options.kind === "review";
   const assignedConsumer = options.assignedConsumer || card.assignedConsumer || undefined;
+  const gated = !isReview && card.doneWhen.length > 0;
+  const lastRejected = gated ? lastRejectedAttempt(card) : null;
 
   return {
     task_id: isReview ? undefined : card.taskId,
@@ -1810,7 +2284,18 @@ function toPublisherPayload(
     messages: [
       {
         role: "user",
-        content: isReview ? reviewPrompt(card) : `${card.title}\n\n${card.prompt}`
+        content: isReview
+          ? reviewPrompt(card)
+          : gated
+            ? composeWorkPrompt({
+                title: card.title,
+                prompt: card.prompt,
+                spec: card.spec,
+                doneWhen: card.doneWhen,
+                attempt: card.attempt,
+                previousAttempt: lastRejected
+              })
+            : `${card.title}\n\n${card.prompt}`
       }
     ],
     metadata: {
@@ -1827,9 +2312,29 @@ function toPublisherPayload(
       depends_on_task_id: card.dependsOnTaskId || null,
       auto_publish_on_dependency: card.autoPublishOnDependency,
       due_date: card.dueDate,
-      tags: card.tags
+      tags: card.tags,
+      spec: card.spec || null,
+      done_when: card.doneWhen,
+      attempt: card.attempt,
+      parent_task_id: lastRejected?.taskId ?? null,
+      feedback: lastRejected?.humanFeedback ?? null,
+      project_id: options.projectId ?? null
     }
   };
+}
+
+function lastRejectedAttempt(card: KanbanCard): AttemptRecord | null {
+  if (card.attempt <= 1) {
+    return null;
+  }
+
+  for (let index = card.attemptHistory.length - 1; index >= 0; index -= 1) {
+    if (card.attemptHistory[index].humanAction === "rejected") {
+      return card.attemptHistory[index];
+    }
+  }
+
+  return null;
 }
 
 function reviewPrompt(card: KanbanCard) {
@@ -1843,11 +2348,36 @@ function reviewPrompt(card: KanbanCard) {
   ].join("\n\n");
 }
 
-function loadCards() {
-  const stored = localStorage.getItem(storageKey);
-  if (!stored) {
-    return initialCards;
+function storageKeyForProject(projectId: string) {
+  return projectId ? `${storageKey}:project:${projectId}` : storageKey;
+}
+
+function loadActiveProjectId() {
+  return localStorage.getItem(activeProjectStorageKey) ?? "";
+}
+
+function loadCachedProjects(): ProjectRef[] {
+  try {
+    const parsed = JSON.parse(localStorage.getItem(projectsCacheKey) ?? "[]") as ProjectRef[];
+    return Array.isArray(parsed)
+      ? parsed.filter(
+          (project) =>
+            Boolean(project) && typeof project.id === "string" && typeof project.name === "string"
+        )
+      : [];
+  } catch {
+    return [];
   }
+}
+
+function loadCards(projectId: string) {
+  const stored = localStorage.getItem(storageKeyForProject(projectId));
+  if (!stored) {
+    // Project boards start empty; the demo cards only seed the default board.
+    return projectId ? [] : initialCards;
+  }
+
+  const fallback = projectId ? [] : initialCards;
 
   try {
     const parsed = JSON.parse(stored) as KanbanCard[];
@@ -1858,11 +2388,15 @@ function loadCards() {
           assignedConsumer: card.assignedConsumer ?? "",
           requiresReview: Boolean(card.requiresReview),
           dependsOnTaskId: card.dependsOnTaskId ?? "",
-          autoPublishOnDependency: Boolean(card.autoPublishOnDependency)
+          autoPublishOnDependency: Boolean(card.autoPublishOnDependency),
+          spec: typeof card.spec === "string" ? card.spec : "",
+          doneWhen: Array.isArray(card.doneWhen) ? card.doneWhen : [],
+          attempt: typeof card.attempt === "number" && card.attempt > 0 ? card.attempt : 1,
+          attemptHistory: Array.isArray(card.attemptHistory) ? card.attemptHistory : []
         }))
-      : initialCards;
+      : fallback;
   } catch {
-    return initialCards;
+    return fallback;
   }
 }
 
@@ -1879,7 +2413,9 @@ function newDraft(): DraftCard {
     dependsOnTaskId: "",
     autoPublishOnDependency: false,
     dueDate: todayPlus(2),
-    tagsText: ""
+    tagsText: "",
+    spec: "",
+    doneWhenText: ""
   };
 }
 
@@ -1900,6 +2436,43 @@ function dependencyLabel(cards: KanbanCard[], dependsOnTaskId: string) {
   return dependency ? dependency.title : "Missing task";
 }
 
+function upsertAttempt(history: AttemptRecord[], record: AttemptRecord) {
+  const filtered = history.filter((item) => item.attempt !== record.attempt);
+  return [...filtered, record].sort((left, right) => left.attempt - right.attempt);
+}
+
+/** Stamps the human decision onto the current attempt's record, creating one if the
+ * work update never produced it (e.g. output arrived through a fallback path). */
+function finalizeAttempt(
+  card: KanbanCard,
+  action: "approved" | "rejected",
+  feedback?: string
+): AttemptRecord[] {
+  const exists = card.attemptHistory.some((record) => record.attempt === card.attempt);
+
+  if (exists) {
+    return card.attemptHistory.map((record) =>
+      record.attempt === card.attempt
+        ? { ...record, humanAction: action, humanFeedback: feedback }
+        : record
+    );
+  }
+
+  return [
+    ...card.attemptHistory,
+    {
+      attempt: card.attempt,
+      taskId: card.taskId,
+      output: card.resultMessage ?? "",
+      verdict: card.verdict,
+      consumer: card.completedBy,
+      completedAt: card.completedAt ?? Date.now(),
+      humanAction: action,
+      humanFeedback: feedback
+    }
+  ];
+}
+
 function releaseDependentCards(cards: KanbanCard[], completedTaskId: string) {
   return cards.map((card) =>
     card.column === "backlog" && card.dependsOnTaskId === completedTaskId
@@ -1917,6 +2490,16 @@ function taskUpdateKind(
   card: KanbanCard,
   update: PublisherTaskUpdate
 ): PublishKind | null {
+  // A result naming a task id that matches neither the card's current work task
+  // nor its review task belongs to a superseded attempt (e.g. rejected and
+  // respawned) and must not overwrite the live attempt via the card_id fallback.
+  if (
+    update.task_id &&
+    update.task_id !== card.taskId &&
+    update.task_id !== card.reviewTaskId
+  ) {
+    return null;
+  }
   if (update.card_id && card.id === update.card_id && update.task_kind === "review") {
     return "review";
   }
