@@ -165,6 +165,15 @@ async fn main() -> Result<()> {
         .route("/consumers", get(consumers))
         .route("/api/session", get(session_status))
         .route("/api/brain/projects", get(brain_projects))
+        .route(
+            "/api/brain/attempts",
+            get(brain_attempts).post(brain_attempts_post),
+        )
+        .route(
+            "/api/brain/evals",
+            get(brain_evals).post(brain_evals_post).patch(brain_evals_patch),
+        )
+        .route("/api/brain/evals/match", get(brain_evals_match))
         .route("/ws", get(ws_handler))
         .fallback(frontend_handler)
         .layer(TraceLayer::new_for_http())
@@ -290,56 +299,83 @@ async fn consumers(
     Json(response).into_response()
 }
 
-/// Proxies the launching user's 2ndBrain project list. The browser authenticates with its
-/// launch session cookie; the publisher forwards server-to-server with the bridge secret and
-/// the session's user_id, mirroring `verify_launch_session_active`.
-async fn brain_projects(
-    Query(params): Query<HashMap<String, String>>,
-    headers: HeaderMap,
-    State(state): State<Arc<AppState>>,
-) -> axum::response::Response {
-    let session = match launch_session_from_request(&state.launch_auth, &params, &headers) {
+/// Authenticates a browser request to an `/api/brain/*` proxy route: validates the launch
+/// session (cookie or token) and confirms it is still active in 2ndBrain. `Ok(None)` means
+/// launch auth is disabled (local dev), so there is no user to scope by.
+async fn brain_bridge_session(
+    state: &Arc<AppState>,
+    params: &HashMap<String, String>,
+    headers: &HeaderMap,
+    endpoint: &'static str,
+) -> Result<Option<LaunchSession>, axum::response::Response> {
+    let session = match launch_session_from_request(&state.launch_auth, params, headers) {
         Ok(Some(session)) => session,
-        Ok(None) => {
-            // Launch auth disabled (local dev): no user to scope by, so no projects.
-            return Json(json!({ "projects": [] })).into_response();
-        }
+        Ok(None) => return Ok(None),
         Err(err) => {
-            warn!(error = %err, "brain projects auth failed");
-            return (
+            warn!(error = %err, endpoint, "brain bridge auth failed");
+            return Err((
                 StatusCode::UNAUTHORIZED,
                 "valid 2ndBrain launch session is required",
             )
-                .into_response();
+                .into_response());
         }
     };
 
-    if let Err(err) = verify_launch_session_active(&state, Some(&session)).await {
-        warn!(error = %err, "brain projects launch session inactive");
-        return (
+    if let Err(err) = verify_launch_session_active(state, Some(&session)).await {
+        warn!(error = %err, endpoint, "brain bridge launch session inactive");
+        return Err((
             StatusCode::UNAUTHORIZED,
             "2ndBrain launch session is no longer active",
         )
-            .into_response();
+            .into_response());
     }
 
-    let (Some(base_url), Some(secret)) = (
+    Ok(Some(session))
+}
+
+/// Forwards an authenticated `/api/brain/*` request server-to-server to 2ndBrain, attaching the
+/// bridge secret and the session's user_id. When the bridge is unconfigured (or launch auth is
+/// disabled), read endpoints answer with `unconfigured` so the frontend degrades gracefully,
+/// while mutating endpoints (no fallback) answer 503.
+async fn forward_brain_request(
+    state: &Arc<AppState>,
+    session: Option<&LaunchSession>,
+    method: reqwest::Method,
+    path: &'static str,
+    query: &[(&str, &str)],
+    body: Option<&Value>,
+    unconfigured: Option<Value>,
+) -> axum::response::Response {
+    let (Some(session), Some(base_url), Some(secret)) = (
+        session,
         state.brain_api_url.as_deref(),
         state.brain_api_secret.as_deref(),
     ) else {
-        return Json(json!({ "projects": [] })).into_response();
+        return match unconfigured {
+            Some(fallback) => Json(fallback).into_response(),
+            None => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "2ndBrain bridge is not configured",
+            )
+                .into_response(),
+        };
     };
 
-    let url = format!("{}/api/gyne/projects", base_url.trim_end_matches('/'));
-    let response = state
+    let url = format!("{}{}", base_url.trim_end_matches('/'), path);
+    let mut request = state
         .launch_verify_client
-        .get(&url)
+        .request(method, &url)
         .bearer_auth(secret)
         .query(&[("user_id", session.user_id.as_str())])
-        .send()
-        .await;
+        .query(&query);
 
-    match response {
+    if let Some(body) = body {
+        request = request
+            .header("content-type", "application/json")
+            .body(body.to_string());
+    }
+
+    match request.send().await {
         Ok(upstream) => {
             let status = StatusCode::from_u16(upstream.status().as_u16())
                 .unwrap_or(StatusCode::BAD_GATEWAY);
@@ -351,16 +387,196 @@ async fn brain_projects(
                 )
                     .into_response(),
                 Err(err) => {
-                    warn!(error = %err, "brain projects upstream body failed");
+                    warn!(error = %err, path, "brain bridge upstream body failed");
                     (StatusCode::BAD_GATEWAY, "2ndBrain bridge response failed").into_response()
                 }
             }
         }
         Err(err) => {
-            warn!(error = %err, "brain projects upstream request failed");
+            warn!(error = %err, path, "brain bridge upstream request failed");
             (StatusCode::BAD_GATEWAY, "2ndBrain bridge request failed").into_response()
         }
     }
+}
+
+/// Proxies the launching user's 2ndBrain project list. The browser authenticates with its
+/// launch session cookie; the publisher forwards server-to-server with the bridge secret and
+/// the session's user_id, mirroring `verify_launch_session_active`.
+async fn brain_projects(
+    Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+    State(state): State<Arc<AppState>>,
+) -> axum::response::Response {
+    let session = match brain_bridge_session(&state, &params, &headers, "projects").await {
+        Ok(session) => session,
+        Err(response) => return response,
+    };
+
+    forward_brain_request(
+        &state,
+        session.as_ref(),
+        reqwest::Method::GET,
+        "/api/gyne/projects",
+        &[],
+        None,
+        Some(json!({ "projects": [] })),
+    )
+    .await
+}
+
+/// Proxies the durable attempt history for one kanban card (`?card_id=`).
+async fn brain_attempts(
+    Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+    State(state): State<Arc<AppState>>,
+) -> axum::response::Response {
+    let session = match brain_bridge_session(&state, &params, &headers, "attempts").await {
+        Ok(session) => session,
+        Err(response) => return response,
+    };
+
+    let card_id = params.get("card_id").map(String::as_str).unwrap_or("");
+    forward_brain_request(
+        &state,
+        session.as_ref(),
+        reqwest::Method::GET,
+        "/api/gyne/attempts",
+        &[("card_id", card_id)],
+        None,
+        Some(json!({ "attempts": [] })),
+    )
+    .await
+}
+
+/// Proxies an attempt upsert (fired by the frontend at terminal updates and Approve/Reject).
+async fn brain_attempts_post(
+    Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<Value>,
+) -> axum::response::Response {
+    let session = match brain_bridge_session(&state, &params, &headers, "attempts").await {
+        Ok(session) => session,
+        Err(response) => return response,
+    };
+
+    forward_brain_request(
+        &state,
+        session.as_ref(),
+        reqwest::Method::POST,
+        "/api/gyne/attempts",
+        &[],
+        Some(&body),
+        None,
+    )
+    .await
+}
+
+/// Proxies the user's eval list (`?active=true|false` optional).
+async fn brain_evals(
+    Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+    State(state): State<Arc<AppState>>,
+) -> axum::response::Response {
+    let session = match brain_bridge_session(&state, &params, &headers, "evals").await {
+        Ok(session) => session,
+        Err(response) => return response,
+    };
+
+    let mut query: Vec<(&str, &str)> = Vec::new();
+    if let Some(active) = params.get("active") {
+        query.push(("active", active.as_str()));
+    }
+
+    forward_brain_request(
+        &state,
+        session.as_ref(),
+        reqwest::Method::GET,
+        "/api/gyne/evals",
+        &query,
+        None,
+        Some(json!({ "evals": [] })),
+    )
+    .await
+}
+
+/// Proxies eval creation ("Promote to eval").
+async fn brain_evals_post(
+    Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<Value>,
+) -> axum::response::Response {
+    let session = match brain_bridge_session(&state, &params, &headers, "evals").await {
+        Ok(session) => session,
+        Err(response) => return response,
+    };
+
+    forward_brain_request(
+        &state,
+        session.as_ref(),
+        reqwest::Method::POST,
+        "/api/gyne/evals",
+        &[],
+        Some(&body),
+        None,
+    )
+    .await
+}
+
+/// Proxies eval updates (deactivate, edit criterion/matchers).
+async fn brain_evals_patch(
+    Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<Value>,
+) -> axum::response::Response {
+    let session = match brain_bridge_session(&state, &params, &headers, "evals").await {
+        Ok(session) => session,
+        Err(response) => return response,
+    };
+
+    forward_brain_request(
+        &state,
+        session.as_ref(),
+        reqwest::Method::PATCH,
+        "/api/gyne/evals",
+        &[],
+        Some(&body),
+        None,
+    )
+    .await
+}
+
+/// Proxies eval matching at publish time (`?tags=a,b&q=title+prompt`).
+async fn brain_evals_match(
+    Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+    State(state): State<Arc<AppState>>,
+) -> axum::response::Response {
+    let session = match brain_bridge_session(&state, &params, &headers, "evals/match").await {
+        Ok(session) => session,
+        Err(response) => return response,
+    };
+
+    let mut query: Vec<(&str, &str)> = Vec::new();
+    if let Some(tags) = params.get("tags") {
+        query.push(("tags", tags.as_str()));
+    }
+    if let Some(q) = params.get("q") {
+        query.push(("q", q.as_str()));
+    }
+
+    forward_brain_request(
+        &state,
+        session.as_ref(),
+        reqwest::Method::GET,
+        "/api/gyne/evals/match",
+        &query,
+        None,
+        Some(json!({ "evals": [] })),
+    )
+    .await
 }
 
 async fn session_status(

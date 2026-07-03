@@ -2,6 +2,7 @@ import React from "react";
 import { createRoot } from "react-dom/client";
 import {
   Archive,
+  BookmarkPlus,
   Check,
   Circle,
   ClipboardList,
@@ -44,6 +45,12 @@ interface Column {
   accent: string;
 }
 
+/** A reusable acceptance criterion (eval) auto-attached to this card at publish time. */
+interface AttachedEval {
+  id: string;
+  criterion: string;
+}
+
 interface KanbanCard {
   id: string;
   taskId: string;
@@ -61,6 +68,7 @@ interface KanbanCard {
   tags: string[];
   spec: string;
   doneWhen: string[];
+  attachedEvals: AttachedEval[];
   attempt: number;
   attemptHistory: AttemptRecord[];
   verdict?: SelfReviewVerdict;
@@ -215,6 +223,7 @@ const initialCards: KanbanCard[] = [
       "Every intake note is represented in the handoff",
       "Risks and missing data are called out explicitly"
     ],
+    attachedEvals: [],
     attempt: 1,
     attemptHistory: [],
     publishStatus: "draft",
@@ -239,6 +248,7 @@ const initialCards: KanbanCard[] = [
     tags: ["checklist"],
     spec: "",
     doneWhen: [],
+    attachedEvals: [],
     attempt: 1,
     attemptHistory: [],
     publishStatus: "draft",
@@ -246,6 +256,127 @@ const initialCards: KanbanCard[] = [
     updatedAt: Date.now()
   }
 ];
+
+/** Manual done-when criteria plus criteria from evals attached at publish time, deduped. */
+function effectiveDoneWhen(card: KanbanCard): string[] {
+  const merged = [...card.doneWhen];
+  for (const attached of card.attachedEvals) {
+    if (!merged.includes(attached.criterion)) {
+      merged.push(attached.criterion);
+    }
+  }
+  return merged;
+}
+
+// The 2ndBrain bridge is best-effort: publishing and the local board never wait on it for
+// longer than this, and every failure degrades to local-only behavior.
+const BRAIN_BRIDGE_TIMEOUT_MS = 2000;
+
+async function brainFetch(path: string, init?: RequestInit): Promise<Response> {
+  const controller = new AbortController();
+  const timer = window.setTimeout(() => controller.abort(), BRAIN_BRIDGE_TIMEOUT_MS);
+  try {
+    const response = await fetch(path, { ...init, cache: "no-store", signal: controller.signal });
+    if (!response.ok) {
+      throw new Error(`bridge responded ${response.status}`);
+    }
+    return response;
+  } finally {
+    window.clearTimeout(timer);
+  }
+}
+
+/** Fire-and-forget durable attempt upsert; the local attempt history is the source of truth
+ * when the bridge is down, so failures are silently ignored. */
+function persistAttempt(body: Record<string, unknown>) {
+  void brainFetch("/api/brain/attempts", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(body)
+  }).catch(() => {});
+}
+
+/** Snapshot of one card attempt for the durable store, keyed by (user, task_id) server-side. */
+function attemptSnapshot(card: KanbanCard, extra: Record<string, unknown>) {
+  return {
+    card_id: card.id,
+    task_id: card.taskId,
+    attempt: card.attempt,
+    title: card.title,
+    prompt: card.prompt,
+    spec: card.spec,
+    done_when: effectiveDoneWhen(card),
+    ...extra
+  };
+}
+
+/** Asks 2ndBrain which of the user's evals match this card (by tag overlap or keyword in
+ * title+prompt). Returns null on any failure so the caller keeps the previous attachments. */
+async function matchCardEvals(card: KanbanCard): Promise<AttachedEval[] | null> {
+  try {
+    const query = new URLSearchParams({
+      tags: card.tags.join(","),
+      q: `${card.title} ${card.prompt}`
+    });
+    const response = await brainFetch(`/api/brain/evals/match?${query.toString()}`);
+    const payload = (await response.json()) as { evals?: unknown };
+    if (!Array.isArray(payload.evals)) {
+      return null;
+    }
+    return payload.evals
+      .filter(
+        (item): item is { id: string; criterion: string } =>
+          Boolean(item) &&
+          typeof (item as { id?: unknown }).id === "string" &&
+          typeof (item as { criterion?: unknown }).criterion === "string" &&
+          (item as { criterion: string }).criterion.trim() !== ""
+      )
+      .map((item) => ({ id: item.id, criterion: item.criterion.trim() }));
+  } catch {
+    return null;
+  }
+}
+
+const EVAL_KEYWORD_STOPWORDS = new Set([
+  "about",
+  "after",
+  "before",
+  "create",
+  "draft",
+  "every",
+  "from",
+  "into",
+  "make",
+  "task",
+  "that",
+  "their",
+  "them",
+  "then",
+  "there",
+  "these",
+  "this",
+  "when",
+  "with",
+  "write",
+  "your"
+]);
+
+/** Match keywords for a promoted eval, derived from the source card's title. */
+function evalKeywordsFrom(title: string): string[] {
+  const seen = new Set<string>();
+  const keywords: string[] = [];
+  for (const raw of title.toLowerCase().split(/[^a-z0-9]+/)) {
+    if (raw.length < 4 || EVAL_KEYWORD_STOPWORDS.has(raw) || seen.has(raw)) {
+      continue;
+    }
+    seen.add(raw);
+    keywords.push(raw);
+    if (keywords.length >= 6) {
+      break;
+    }
+  }
+  return keywords;
+}
 
 function readLaunchToken() {
   const params = new URLSearchParams(window.location.search);
@@ -533,7 +664,7 @@ function App() {
     socket.send(JSON.stringify({ type: "list_consumers" }));
   }
 
-  function flushPublishQueue(socket = socketRef.current) {
+  async function flushPublishQueue(socket = socketRef.current) {
     if (!socket || socket.readyState !== WebSocket.OPEN) {
       return;
     }
@@ -598,9 +729,32 @@ function App() {
           : item
       )
     );
+    // Work publishes ask 2ndBrain for matching evals first (bounded by the bridge timeout);
+    // matched criteria gate this attempt exactly like manual done-when entries. A bridge
+    // failure keeps the card's previous attachments so a mid-loop retry doesn't lose its gate.
+    let cardForPublish = card;
+    if (nextItem.kind === "work") {
+      const matched = await matchCardEvals(card);
+      if (matched) {
+        cardForPublish = { ...card, attachedEvals: matched };
+        setCards((current) =>
+          current.map((item) =>
+            item.id === card.id
+              ? { ...item, attachedEvals: matched, updatedAt: Date.now() }
+              : item
+          )
+        );
+      }
+      if (socket.readyState !== WebSocket.OPEN) {
+        clearPendingPublish();
+        markCardFailed(nextItem.cardId, "Publisher connection closed while publishing");
+        return;
+      }
+    }
+
     socket.send(
       JSON.stringify(
-        toPublisherPayload(card, {
+        toPublisherPayload(cardForPublish, {
           kind: nextItem.kind,
           assignedConsumer,
           excludeConsumer: nextItem.excludeConsumer,
@@ -742,7 +896,7 @@ function App() {
     const matchedCard = cardsRef.current.find((card) => taskUpdateKind(card, update));
     const updateKind = matchedCard ? taskUpdateKind(matchedCard, update) : null;
     const status = normalizeUpdateStatus(update.status);
-    const matchedGated = Boolean(matchedCard && matchedCard.doneWhen.length > 0);
+    const matchedGated = Boolean(matchedCard && effectiveDoneWhen(matchedCard).length > 0);
     const shouldRouteReview =
       matchedCard &&
       updateKind === "work" &&
@@ -778,7 +932,7 @@ function App() {
           return card;
         }
 
-        const gated = card.doneWhen.length > 0;
+        const gated = effectiveDoneWhen(card).length > 0;
 
         if (kind === "review") {
           // With acceptance criteria the AI cross-review is evidence, not a gate
@@ -864,6 +1018,22 @@ function App() {
 
       return releaseDependentCards(updatedCards, completedDependencyTaskId);
     });
+
+    // Mirror the gated terminal attempt into the durable store (fire-and-forget; the
+    // localStorage attempt history stays the source of truth when the bridge is down).
+    if (matchedCard && updateKind === "work" && matchedGated && status === "done") {
+      const fullText = completionText(update.response) ?? update.message ?? "";
+      const parsedVerdict = parseSelfReview(fullText);
+      const displayMessage =
+        fullText ? stripVerdictBlock(fullText) || update.message : update.message;
+      persistAttempt(
+        attemptSnapshot(matchedCard, {
+          output: displayMessage ?? "",
+          verdict: parsedVerdict ?? { criteria: [], overallPass: false, parseError: true },
+          consumer: update.consumer ?? null
+        })
+      );
+    }
 
     if (shouldRouteReview && matchedCard) {
       enqueueCards([matchedCard.id], "review", update.consumer);
@@ -996,6 +1166,7 @@ function App() {
                 taskId: reworkMode ? crypto.randomUUID() : card.taskId,
                 attempt: reworkMode ? 1 : card.attempt,
                 attemptHistory: reworkMode ? [] : card.attemptHistory,
+                attachedEvals: reworkMode ? [] : card.attachedEvals,
                 verdict: undefined,
                 awaitingApproval: false,
                 publishStatus:
@@ -1039,6 +1210,7 @@ function App() {
         tags,
         spec: draft.spec.trim(),
         doneWhen,
+        attachedEvals: [],
         attempt: 1,
         attemptHistory: [],
         publishStatus: "draft",
@@ -1206,6 +1378,15 @@ function App() {
       )
     );
 
+    persistAttempt(
+      attemptSnapshot(card, {
+        output: card.resultMessage ?? "",
+        verdict: card.verdict ?? null,
+        consumer: card.completedBy ?? null,
+        human_action: "approved"
+      })
+    );
+
     if (autoPublishIds.length > 0) {
       enqueueCards(autoPublishIds, "work");
       if (socketStatus === "closed") {
@@ -1256,11 +1437,48 @@ function App() {
       )
     );
 
+    persistAttempt(
+      attemptSnapshot(card, {
+        output: card.resultMessage ?? "",
+        verdict: card.verdict ?? null,
+        consumer: card.completedBy ?? null,
+        human_action: "rejected",
+        human_feedback: trimmed
+      })
+    );
+
     enqueueCards([cardId], "work");
     if (socketStatus === "closed") {
       connect();
     }
     setLastEvent(`Rejected ${card.title} — running attempt ${card.attempt + 1}`);
+  }
+
+  // Promote a failed criterion or reviewer feedback into a reusable eval: 2ndBrain stores it
+  // and it auto-attaches to future cards that share a tag or a title keyword.
+  async function promoteToEval(card: KanbanCard, criterion: string, rationale?: string) {
+    const trimmed = criterion.trim();
+    if (!trimmed) {
+      return;
+    }
+
+    try {
+      await brainFetch("/api/brain/evals", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          criterion: trimmed,
+          rationale: rationale?.trim() || null,
+          match_tags: card.tags,
+          match_keywords: evalKeywordsFrom(card.title),
+          source_card_id: card.id,
+          source_task_id: card.taskId
+        })
+      });
+      setLastEvent(`Saved eval: ${trimmed.length > 60 ? `${trimmed.slice(0, 60)}…` : trimmed}`);
+    } catch {
+      setLastEvent("Could not save eval — the 2ndBrain bridge is unavailable");
+    }
   }
 
   function publishColumn(column: ColumnId) {
@@ -1576,7 +1794,7 @@ function App() {
               <Field
                 label="Attempt"
                 value={
-                  selectedCard.doneWhen.length > 0
+                  effectiveDoneWhen(selectedCard).length > 0
                     ? String(selectedCard.attempt)
                     : "—"
                 }
@@ -1584,8 +1802,14 @@ function App() {
               <Field
                 label="Criteria"
                 value={
-                  selectedCard.doneWhen.length > 0
-                    ? `${selectedCard.doneWhen.length} defined`
+                  effectiveDoneWhen(selectedCard).length > 0
+                    ? `${selectedCard.doneWhen.length} defined${
+                        selectedCard.attachedEvals.length > 0
+                          ? ` · ${selectedCard.attachedEvals.length} eval${
+                              selectedCard.attachedEvals.length === 1 ? "" : "s"
+                            }`
+                          : ""
+                      }`
                     : "None"
                 }
               />
@@ -1623,6 +1847,21 @@ function App() {
               />
               <Field label="Result ID" value={selectedCard.resultStreamId ?? "None"} />
             </div>
+            {selectedCard.attachedEvals.length > 0 ? (
+              <div className="eval-chips">
+                <div className="panel-title">
+                  <BookmarkPlus size={18} />
+                  <span>Attached evals</span>
+                </div>
+                <div className="eval-chip-list">
+                  {selectedCard.attachedEvals.map((attached) => (
+                    <span className="eval-chip" key={attached.id} title={attached.criterion}>
+                      {attached.criterion}
+                    </span>
+                  ))}
+                </div>
+              </div>
+            ) : null}
             <div className="prompt-panel">
               <div className="panel-title">
                 <MessageSquareText size={18} />
@@ -1677,6 +1916,19 @@ function App() {
                       <strong>{criterion.criterion}</strong>
                       {criterion.evidence ? <span>{criterion.evidence}</span> : null}
                     </div>
+                    {!criterion.pass ? (
+                      <button
+                        type="button"
+                        className="promote-eval-button"
+                        title="Save as a reusable eval that auto-attaches to similar future tasks"
+                        onClick={() =>
+                          promoteToEval(selectedCard, criterion.criterion, criterion.evidence)
+                        }
+                      >
+                        <BookmarkPlus size={14} />
+                        Eval
+                      </button>
+                    ) : null}
                   </div>
                 ))}
                 {selectedCard.verdict.notes ? (
@@ -1766,6 +2018,23 @@ function App() {
                       </header>
                       {record.humanFeedback ? (
                         <p className="attempt-feedback">{record.humanFeedback}</p>
+                      ) : null}
+                      {record.humanAction === "rejected" && record.humanFeedback ? (
+                        <button
+                          type="button"
+                          className="promote-eval-button"
+                          title="Save this feedback as a reusable eval for similar future tasks"
+                          onClick={() =>
+                            promoteToEval(
+                              selectedCard,
+                              record.humanFeedback ?? "",
+                              `Reviewer feedback on attempt ${record.attempt} of "${selectedCard.title}"`
+                            )
+                          }
+                        >
+                          <BookmarkPlus size={14} />
+                          Promote to eval
+                        </button>
                       ) : null}
                       {record.output ? (
                         <p className="attempt-output">{record.output}</p>
@@ -2274,7 +2543,8 @@ function toPublisherPayload(
 ) {
   const isReview = options.kind === "review";
   const assignedConsumer = options.assignedConsumer || card.assignedConsumer || undefined;
-  const gated = !isReview && card.doneWhen.length > 0;
+  const doneWhen = effectiveDoneWhen(card);
+  const gated = !isReview && doneWhen.length > 0;
   const lastRejected = gated ? lastRejectedAttempt(card) : null;
 
   return {
@@ -2291,7 +2561,7 @@ function toPublisherPayload(
                 title: card.title,
                 prompt: card.prompt,
                 spec: card.spec,
-                doneWhen: card.doneWhen,
+                doneWhen,
                 attempt: card.attempt,
                 previousAttempt: lastRejected
               })
@@ -2314,7 +2584,8 @@ function toPublisherPayload(
       due_date: card.dueDate,
       tags: card.tags,
       spec: card.spec || null,
-      done_when: card.doneWhen,
+      done_when: doneWhen,
+      attached_eval_ids: card.attachedEvals.map((attached) => attached.id),
       attempt: card.attempt,
       parent_task_id: lastRejected?.taskId ?? null,
       feedback: lastRejected?.humanFeedback ?? null,
@@ -2391,6 +2662,14 @@ function loadCards(projectId: string) {
           autoPublishOnDependency: Boolean(card.autoPublishOnDependency),
           spec: typeof card.spec === "string" ? card.spec : "",
           doneWhen: Array.isArray(card.doneWhen) ? card.doneWhen : [],
+          attachedEvals: Array.isArray(card.attachedEvals)
+            ? card.attachedEvals.filter(
+                (item) =>
+                  Boolean(item) &&
+                  typeof item.id === "string" &&
+                  typeof item.criterion === "string"
+              )
+            : [],
           attempt: typeof card.attempt === "number" && card.attempt > 0 ? card.attempt : 1,
           attemptHistory: Array.isArray(card.attemptHistory) ? card.attemptHistory : []
         }))
